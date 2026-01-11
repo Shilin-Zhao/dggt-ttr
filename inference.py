@@ -124,7 +124,7 @@ def main():
     checkpoint = torch.load(args.ckpt_path, map_location="cpu")
     model.load_state_dict(checkpoint, strict=True)
     if args.mode == 3:
-        track_ckpt = 'path_to_track_model'
+        track_ckpt = '/root/pretrained/tracking_model.pth'
         track_model = load_model(track_ckpt)
         track_model.to(device)
         track_model.seq_len = 2
@@ -297,11 +297,11 @@ def main():
             scene_name = str(scene_idx).zfill(3)
             inference_time = time.time() - start_time
             inference_time_list.append(inference_time)
-            if args.difix:
+            if args.diffusion:
                 processed_frames = []
                 for i in range(rendered_image.shape[0]):
                     frame = rendered_image[i].detach().cpu().clamp(0, 1)
-                    processed_frame = process_images_with_difix(frame, "path_to_diffusion_model")
+                    processed_frame = process_images_with_difix(frame, "/root/pretrained/diffusion_model.pth")
                     processed_frames.append(processed_frame)
                 rendered_image = torch.stack(processed_frames, dim=0).to(device)
             

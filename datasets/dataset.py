@@ -57,7 +57,7 @@ def load_and_preprocess_flow(flow_path_list, extrinsic_paths, intrinsic_path, he
     return torch.stack(flows)
 
 
-def load_and_preprocess_images(image_path_list, mode="crop"):
+def load_and_preprocess_images(image_path_list, mode="crop", resample_method=Image.Resampling.BICUBIC):
     # Check for empty list
     if len(image_path_list) == 0:
         raise ValueError("At least 1 image is required")
@@ -91,7 +91,7 @@ def load_and_preprocess_images(image_path_list, mode="crop"):
         new_height = round(height * (new_width / width) / 14) * 14
 
         # Resize with new dimensions (width, height)
-        img = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
+        img = img.resize((new_width, new_height), resample_method)
         img = to_tensor(img)  # Convert to tensor (0, 1)
 
         if new_height > target_size:
@@ -351,12 +351,14 @@ class WaymoOpenDataset(Dataset):
             if self.views == 1:
                 mask_seq = [sky_mask_paths[i] for i in indices]
                 masks = load_and_preprocess_images(mask_seq)  # [S, C, H, W]
+                nearest_masks = load_and_preprocess_images(mask_seq, resample_method=Image.Resampling.NEAREST)  # [S, C, H, W]
             elif self.views == 3:
                 mask_seq = []
                 for i in indices:
                     for v in range(3):
                         mask_seq.append(sky_mask_paths[v][i])
                 masks = load_and_preprocess_images(mask_seq)  # [S*3, C, H, W]
+                nearest_masks = load_and_preprocess_images(mask_seq, resample_method=Image.Resampling.NEAREST)  # [S*3, C, H, W]
 
             timestamps = np.array(indices) - start_idx
             timestamps = timestamps / timestamps[-1] * (self.sequence_length / 4)
@@ -366,6 +368,7 @@ class WaymoOpenDataset(Dataset):
             input_dict = {
                 "images": images,
                 "masks": masks,
+                "nearest_masks": nearest_masks,
                 "image_paths": seq,
                 "timestamps": timestamps,
                 "interval": intervals,
@@ -403,7 +406,12 @@ class WaymoOpenDataset(Dataset):
             return input_dict
 
         elif self.mode == 2: 
-            start_idx = 0
+            # honor the provided start_idx when doing reconstruction
+            start_idx = self.start_idx if self.start_idx is not None and self.start_idx >= 0 else 0
+            # ensure we do not go out of bounds
+            seq_len = len(image_paths[0]) if self.views == 3 else len(image_paths)
+            max_start = max(0, seq_len - self.sequence_length * self.interval)
+            start_idx = min(start_idx, max_start)
             indices = [start_idx + i * self.interval for i in range(self.sequence_length)]
             intervals = [self.interval for _ in range(self.sequence_length - 1)]
             
@@ -427,12 +435,14 @@ class WaymoOpenDataset(Dataset):
             if self.views == 1:
                 mask_seq = [sky_mask_paths[i] for i in indices]
                 masks = load_and_preprocess_images(mask_seq)  # [S, C, H, W]
+                nearest_masks = load_and_preprocess_images(mask_seq, resample_method=Image.Resampling.NEAREST)  # [S, C, H, W]
             elif self.views == 3:
                 mask_seq = []
                 for i in indices:
                     for v in range(3):
                         mask_seq.append(sky_mask_paths[v][i])
                 masks = load_and_preprocess_images(mask_seq)  # [S*3, C, H, W]
+                nearest_masks = load_and_preprocess_images(mask_seq, resample_method=Image.Resampling.NEAREST)  # [S*3, C, H, W]
                 
 
 
@@ -440,6 +450,7 @@ class WaymoOpenDataset(Dataset):
                 "images": images,
                 "image_paths": seq,
                 "masks": masks,
+                "nearest_masks": nearest_masks,
                 "timestamps": timestamps,
                 "interval": intervals,
             }
@@ -485,7 +496,11 @@ class WaymoOpenDataset(Dataset):
             return input_dict
 
         else:  # self.mode == 3
-            start_idx = 0
+            start_idx = self.start_idx if self.start_idx is not None and self.start_idx >= 0 else 0
+            # ensure we do not go out of bounds
+            seq_len = len(image_paths[0]) if self.views == 3 else len(image_paths)
+            max_start = max(0, seq_len - self.sequence_length * self.interval)
+            start_idx = min(start_idx, max_start)
             indices = [start_idx + i * self.interval for i in range(self.sequence_length)]
             intervals = [self.interval for _ in range(self.sequence_length - 1)]
             target_indices = [start_idx + i for i in range(self.sequence_length * self.interval - (self.interval - 1))]
@@ -518,30 +533,36 @@ class WaymoOpenDataset(Dataset):
             if self.views == 1:
                 mask_seq = [sky_mask_paths[i] for i in indices]
                 masks = load_and_preprocess_images(mask_seq)  # [S, C, H, W]
+                nearest_masks = load_and_preprocess_images(mask_seq, resample_method=Image.Resampling.NEAREST)  # [S, C, H, W]
                 target_mask_seq = [sky_mask_paths[i] for i in target_indices]
                 target_masks = load_and_preprocess_images(target_mask_seq)  # [T, C, H, W]
+                target_nearest_masks = load_and_preprocess_images(target_mask_seq, resample_method=Image.Resampling.NEAREST)  # [T, C, H, W]
             elif self.views == 3:
                 mask_seq = []
                 for i in indices:
                     for v in range(3):
                         mask_seq.append(sky_mask_paths[v][i])
                 masks = load_and_preprocess_images(mask_seq)  # [S*3, C, H, W]
+                nearest_masks = load_and_preprocess_images(mask_seq, resample_method=Image.Resampling.NEAREST)  # [S*3, C, H, W]
 
                 target_mask_seq = []
                 for i in target_indices:
                     for v in range(3):
                         target_mask_seq.append(sky_mask_paths[v][i])
                 target_masks = load_and_preprocess_images(target_mask_seq)  # [T*3, C, H, W]
+                target_nearest_masks = load_and_preprocess_images(target_mask_seq, resample_method=Image.Resampling.NEAREST)  # [T*3, C, H, W]
 
             input_dict = {
                 "images": images,
                 "targets": target_images,
                 "masks": masks,
+                "nearest_masks": nearest_masks,
                 "image_paths": seq,
                 "timestamps": timestamps,
                 # "target_timestamps": target_timestamps,
                 "interval": intervals,
                 "target_masks": target_masks,
+                "target_nearest_masks": target_nearest_masks,
             }
 
             if len(dynamic_mask_paths) > 0:

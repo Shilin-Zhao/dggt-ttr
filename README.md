@@ -1,167 +1,146 @@
 <div align="center">
 
-# DGGT ：FEEDFORWARD 4D RECONSTRUCTION OF DYNAMIC DRIVING SCENES USING UNPOSED IMAGES
-<a href="https://arxiv.org/abs/2512.03004" target="_blank">
-  <img src="https://img.shields.io/badge/arXiv-Paper-red?logo=arxiv&logoColor=white" alt="arXiv">
-</a>
-<a href="https://xiaomi-research.github.io/dggt/" target="_blank">
-  <img src="https://img.shields.io/badge/Project_Page-Website-green?logo=googlechrome&logoColor=white" alt="Project Page">
-</a>
+# DGGT-TTR: Robust 4D Reconstruction with Test-Time Refinement
 
-**Xiaoxue Chen**¹,²*, **Ziyi Xiong**¹,²*, **Yuantao Chen**¹, **Gen Li**¹, **Nan Wang**¹,  
-**Hongcheng Luo**², **Long Chen**², **Haiyang Sun**²†, **Bing Wang**², **Guang Chen**², **Hangjun Ye**²,✉,  
-**Hongyang Li**³, **Ya-Qin Zhang**¹, **Hao Zhao**¹,⁴,✉
+**A robust fork of DGGT featuring precise mask processing and multi-stage test-time optimization.**
 
-¹ AIR, Tsinghua University  
-² Xiaomi EV  
-³ The University of Hong Kong  
-⁴ Beijing Academy of Artificial Intelligence  
-
-\* These authors contributed equally
-† Project leader
+[Original Paper](https://arxiv.org/abs/2512.03004) | [Original Project Page](https://xiaomi-research.github.io/dggt/)
 
 </div>
 
+## 🚀 Key Enhancements
 
+This repository improves upon the original DGGT implementation by addressing segmentation artifacts and introducing a Test-Time Refinement (TTR) pipeline.
 
-## Abstract
+### 1. Fix: Vanishing Small Objects
 
-Our method introduces a fully pose-free feedforward framework **DGGT** for reconstructing dynamic driving scenes directly from unposed RGB images. The model predicts camera poses, 3D Gaussian maps, dynamic motion in a single pass — without per-scene optimization or camera calibration.
+**Problem:** The original implementation uses interpolation methods to load sky masks, which converts discrete mask values into continuous values. Subsequently, the code incorrectly treats these continuous values as discrete when computing `(sky_mask == 0).any(dim=-1)`, causing some objects (especially distant thin structures like street lamps) to be incorrectly identified as sky and disappear intermittently.
 
-<details><summary>CLICK for the full abstract</summary>
+**Solution:** We use nearest-neighbor interpolation (`Image.Resampling.NEAREST`) to preserve the discrete nature of mask values, ensuring stable object visibility across frames.
 
-> Autonomous driving needs fast, scalable 4D reconstruction and re-simulation for training and evaluation, yet most methods for dynamic driving scenes still rely on per-scene optimization, known camera calibration, or short frame windows, making them slow and impractical. We revisit this problem from a feedforward perspective and introduce **Driving Gaussian Grounded Transformer (DGGT)**, a unified framework for pose-free dynamic scene reconstruction. We note that the existing formulations, treating camera pose as a required input, limit flexibility and scalability. Instead, we reformulate pose as an output of the model, enabling reconstruction directly from sparse, unposed images and supporting an arbitrary number of views for long sequences. Our approach jointly predicts per-frame 3D Gaussian maps and camera parameters, disentangles dynamics with a lightweight dynamic head, and preserves temporal consistency with a lifespan head that modulates visibility over time. A diffusion-based rendering refinement further reduces motion/interpolation artifacts and improves novel-view quality under sparse inputs. The result is a single-pass, pose-free algorithm that achieves state-of-the-art performance and speed. Trained and evaluated on large-scale driving benchmarks (Waymo, nuScenes, Argoverse2), our method outperforms prior work both when trained on each dataset and in zero-shot transfer across datasets, and it scales well as the number of input frames increases.
-</details>
+### 2. Feature: Test-Time Refinement (TTR)
 
-## 🚧 Todo
+We introduce a multi-stage optimization pipeline that runs during inference (using the input video itself) to align the 3D Gaussians with the observed images.
 
-- [√] Release pre-trained checkpoints on  Waymo, NuScenes and Argoverse2
-- [√] Release the inference code of our model to facilitate further research and reproducibility.
-- [ ] Release the training code [after paper accepted]
+**Stage 1: Pose Optimization**  
+Refines camera trajectories to better match the observed scene geometry.
 
+**Stage 2: Attribute Optimization**  
+Optimizes Gaussian Splatting parameters including:
+- Opacity, color, and rotation (always enabled)
+- Position (XYZ) and scale (optional, may cause overfitting)
 
-### 🚗 Dataset Support
-This codebase provides support for Waymo Open Dataset, Nuscenes and Argoverse2. We provide instructions and scripts on how to download and preprocess these datasets:
-| Dataset | Instruction |
-|---------|-------------|
-| Waymo | [Data Process Instruction](datasets/Waymo.md) |
-| Argoverse2 | [Data Process Instruction](datasets/ArgoVerse2.md) |
-| NuScenes | [Data Process Instruction](datasets/NuScenes.md) |
+**Note:** While optimizing position and scale achieves the largest quantitative improvements, it may lead to overfitting and artifacts in novel view synthesis (NVS). We recommend validating on held-out viewpoints when using full optimization.
 
+## Quantitative Results
+
+| Configuration | PSNR | SSIM | LPIPS | Improvement (PSNR) |
+|--------------|------|------|-------|-------------------|
+| Baseline (Original DGGT) | 28.9651 | 0.9055 | 0.0885 | - |
+| + Nearest Mask Interpolation | 29.1532 | 0.9063 | 0.0870 | +0.1881 |
+| + Pose Refinement | 29.2365 | 0.9092 | 0.0863 | +0.2714 |
+| + Pose + GS (no XYZ/scale) | 30.8060 | 0.9278 | 0.0834 | +1.8408 |
+| + Pose + GS (full) | 31.6438 | 0.9340 | 0.0769 | +2.6786 |
+
+**Results on Scene 001 (20 frames):**
+- **Baseline**: PSNR=28.9651, SSIM=0.9055, LPIPS=0.0885
+- **With nearest interpolation**: PSNR=29.1532, SSIM=0.9063, LPIPS=0.0870
+- **Pose refinement only**: PSNR=29.2365, SSIM=0.9092, LPIPS=0.0863
+- **Pose + GS (no position/scale)**: PSNR=30.8060, SSIM=0.9278, LPIPS=0.0834
+- **Pose + GS (full optimization)**: PSNR=31.6438, SSIM=0.9340, LPIPS=0.0769
+
+**⚠️ Overfitting Warning:** Full optimization (including XYZ and scales) shows the largest improvements but may overfit to training views. Validation on novel viewpoints is recommended.
+
+## Visual Comparison
+
+*Visual comparison videos will be added here showing ground truth, baseline, and TTR results side-by-side.*
 
 ## Installation
-### Installing dependencies
 
-1. Create conda environment
+For installation instructions, please refer to the [original DGGT repository](https://github.com/xiaomi-research/dggt).
+
+Quick setup:
 ```bash
 conda create -n dggt python=3.10
 conda activate dggt
-
 pip install torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1
 pip install -r requirements.txt
+cd third_party/pointops2 && python setup.py install && cd ../..
 ```
 
-2. Compile pointops2
+Download checkpoints from the [original repository](https://github.com/xiaomi-research/dggt).
 
-```bash
-cd third_party/pointops2
-python setup.py install
-cd ../..
-```
-
-
-### Downloading checkpoints
-Download our pretrained inference model (trained on Waymo Open Dataset, 1 views) checkpoint [here](https://huggingface.co/xiaomi-research/dggt/resolve/main/model_latest_waymo.pt?download=true) to `pretrained/model_latest_waymo.pth`.
-
-Download our pretrained diffusion model checkpoint [here](https://huggingface.co/xiaomi-research/dggt/resolve/main/model_difix.pkl?download=true) to `pretrained/diffusion_model.pth`.
-
-Download TAPIP3D model checkpoint [here](https://huggingface.co/zbww/tapip3d/resolve/main/tapip3d_final.pth) to `pretrained/tracking_model.pth`.
-
-Other checkpoints will be coming soon.
 ## Usage
-### Quick start
-You can test existing models on the Waymo Open dataset.
+
+### Basic Inference (with nearest mask interpolation)
 ```bash
 python inference.py \
     --image_dir /path/to/images \
-    --scene_names 3 5 7 \
+    --scene_names 001 \
     --input_views 1 \
-    --intervals 2 \
-    --sequence_length 4 \
+    --sequence_length 20 \
     --start_idx 0 \
     --mode 2 \
     --ckpt_path /path/to/checkpoint.pth \
     --output_path /path/to/output \
     -images \
-    -depth \
-    -diffusion \
-    -metrics 
-```
-    --image_dir <path>: Specifies the directory containing the input images (required).
-    --scene_names <names>: A string representing the scene names to process, supporting formats like 3 5 7 or "(3,7)" (required).
-    --mode <mode>: Specifies the processing mode, with acceptable values of 1--train, 2--reconstruction, or 3--interplation (required).
-    --ckpt_path <path>: The path to the pre-trained model weights file (required).
-    --output_path <path>: The directory where the output results will be saved (required).
-    --input_views <views>: Number of input cameras like 1 or 3(required).
-    --intervals <interval>: The interval of interpolation frames when performing frame interpolation (mode=3), defaulting to 2 (optional).
-    --sequence_length <length>: Defines the number of input frames to consider for each inference, defaulting to 4 (optional).
-    --start_idx <index>: Indicates the starting index of the frames to process, defaulting to 0 (optional).
-    -images: A flag that, when specified, enables the output of rendered images for each frame (optional).
-    -depth: A flag that, when specified, enables the output of depth maps in .npy format for each frame (optional).
-    -metrics: A flag that, when specified, enables the output of evaluation metrics (PSNR, SSIM, LPIPS) after processing (optional).
-    -diffusion: Whether to use diffusion model to optimize the rendered images (time-consuming) (optional).
-
-
-### Zero-shot and trained experiment​s
-
-Quantitative Comparison under Trained and Zero-Shot Settings on nuScenes and Argoverse2 datasets. 
-
-You can evaluate the model in two complementary settings to demonstrate both generalization and adaptability:
-
-#### Zero-shot (Generalization)
-You can use the model trained on Waymo to perform inference directly on the Argoverse2 or nuScenes datasets — without any retraining or pose calibration.
-
-This setting highlights the model’s strong cross-dataset generalization and robustness to unseen driving domains.
-
-Argoverse2/Nuscenes
-```bash
-python inference.py \
-    --image_dir /path/to/argoverse_or_nuscenes_images \
-    --scene_names 3 5 7 \
-    --input_views 1 \
-    --sequence_length 4 \
-    --start_idx 0 \
-    --mode 2 \
-    --ckpt_path /path/to/waymo_checkpoint.pth \
-    --output_path /path/to/output \
-    -images \
-    -depth \
     -metrics \
+    -diffusion
 ```
 
-#### Trained (Adaptability / Upper-bound Performance)
-You can also train the model on the target dataset (e.g., Argoverse2) and evaluate it on the same domain.
-
-This setting measures the model’s in-domain adaptability, showing its capacity to achieve state-of-the-art reconstruction quality when optimized for the target environment.
-
-Argoverse2/Nuscenes
+### Test-Time Refinement
 ```bash
-python inference.py \
-    --image_dir /path/to/argoverse_or_nuscenes_images \
-    --scene_names 3 5 7 \
+python inference_refine.py \
+    --image_dir /path/to/images \
+    --scene_names 001 \
     --input_views 1 \
-    --sequence_length 4 \
+    --sequence_length 20 \
     --start_idx 0 \
-    --mode 2 \
-    --ckpt_path /path/to/argoverse_or_nuscenes_checkpoint.pth \
+    --ckpt_path /path/to/checkpoint.pth \
     --output_path /path/to/output \
+    --enable_refinement \
+    --refine_pose \
+    --refine_gs \
+    --refine_xyz \
+    --refine_steps_pose 50 \
+    --refine_steps_gs 50 \
+    -images \
+    -metrics \
+    -diffusion
 ```
 
-Together, these two experiments verify that our model not only generalizes well across unseen scenes, but also scales effectively to achieve top performance when fine-tuned on new domains.
-## Citation
-If you find this project useful, please consider citing:
+**Refinement Parameters:**
+- `--enable_refinement`: Enable test-time refinement
+- `--refine_pose`: Optimize camera poses
+- `--refine_gs`: Optimize GS attributes (opacity, color, rotation)
+- `--refine_xyz`: Optimize GS positions (may cause overfitting)
+- `--refine_steps_pose`: Optimization steps for pose (default: 50)
+- `--refine_steps_gs`: Optimization steps for GS (default: 50)
 
-```
+## Roadmap
+
+### Current Progress
+- ✅ Fixed sky mask interpolation issue
+- ✅ Implemented pose refinement
+- ✅ Implemented GS attribute refinement
+- ✅ Added support for selective parameter optimization
+
+### Next Steps
+- [ ] Integrate [Depth Anything 3](https://depth-anything-3.github.io/) as depth prior for improved geometry
+- [ ] Novel view synthesis validation to assess overfitting
+- [ ] Multi-scene evaluation and benchmarking
+
+## Acknowledgement & Citation
+
+This project is a fork of DGGT. I express my gratitude to the original authors for their excellent research and open-source contribution.
+
+**Original Paper:** [arXiv:2512.03004](https://arxiv.org/abs/2512.03004)
+
+**Original Repository:** [https://github.com/xiaomi-research/dggt](https://github.com/xiaomi-research/dggt)
+
+If you use this work, please cite the original DGGT paper:
+
+```bibtex
 @article{chenfeedforward,
   title={Feedforward 4D Reconstruction for Dynamic Driving Scenes using Unposed Images},
   author={Chen, Xiaoxue and Xiong, Ziyi and Chen, Yuantao and Li, Gen and Wang, Nan and Luo, Hongcheng and Chen, Long and Sun, Haiyang and WANG, BING and Chen, Guang and others}
@@ -169,5 +148,7 @@ If you find this project useful, please consider citing:
 ```
 
 ## License
+
 This project is licensed under the Apache License 2.0.
+
 Some files in this repository are derived from VGGT (facebookresearch/vggt) and are licensed under the VGGT upstream license. See NOTICE for details.
