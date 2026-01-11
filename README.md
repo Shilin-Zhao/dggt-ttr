@@ -56,8 +56,12 @@ Optimizes Gaussian Splatting parameters including:
 The video below demonstrates the reconstruction stability, specifically focusing on small, distant objects (e.g., street lamps).
 
 <div align="center">
-  <video src="assets/comparison_2x2_highlight.mp4" width="100%" controls autoplay loop muted></video>
+  <video src="https://github.com/user-attachments/assets/2c285129-1ede-42e9-b9b7-5b0c4969104e" width="100%" controls autoplay loop muted></video>
 </div>
+
+
+
+
 
 **Observations:**
 * **DGGT (Baseline):** Distant street lamps tend to vanish or flicker due to mask interpolation issues.
