@@ -53,7 +53,16 @@ Optimizes Gaussian Splatting parameters including:
 
 ## Visual Comparison
 
-*Visual comparison videos will be added here showing ground truth, baseline, and TTR results side-by-side.*
+The video below demonstrates the reconstruction stability, specifically focusing on small, distant objects (e.g., street lamps).
+
+<div align="center">
+  <video src="assets/comparison_2x2_highlight.mp4" width="100%" controls autoplay loop muted></video>
+</div>
+
+**Observations:**
+* **DGGT (Baseline):** Distant street lamps tend to vanish or flicker due to mask interpolation issues.
+* **Nearest Mask:** Switching to nearest-neighbor interpolation alleviates the disappearance issue, though some instability may persist.
+* **TTR (Refine Pose + GS):** In our tests, Test-Time Refinement provides a more stable reconstruction, effectively recovering the geometry of the street lamp.
 
 ## Installation
 
