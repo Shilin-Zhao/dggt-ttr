@@ -78,6 +78,31 @@ The video below demonstrates the reconstruction stability, specifically focusing
 * **Nearest Mask:** Switching to nearest-neighbor interpolation alleviates the disappearance issue, though some instability may persist.
 * **TTR (Refine Pose + GS):** In our tests, Test-Time Refinement provides a more stable reconstruction, effectively recovering the geometry of the street lamp.
 
+## 🧐 Deep Dive: The "Alpha Bleeding" Artifact
+
+While nearest-neighbor interpolation improves mask stability, we identified a critical edge case where distant thin objects (like street lamps) are erased by the diffusion model. 
+
+### The Scene Context
+The image below shows the scene structure. The red box highlights a distant street lamp, which is a challenging geometry for both 3DGS reconstruction and diffusion-based refinement.
+
+<div align="center">
+  <img src="assets/readme_vis/0_scene_context.png" width="60%">
+  <p><i>Figure: Scene with the region of interest (street lamp) highlighted.</i></p>
+</div>
+
+### Mechanism of Failure
+Through controlled experiments, we traced the root cause to the conflict between **3DGS geometry expansion** and **Diffusion denoising**.
+
+| Stage | Visualization (Zoomed) | Analysis |
+| :--- | :---: | :--- |
+| **1. Baseline Reconstruction**<br>(`Raw Output`) | <img src="assets/readme_vis/1_baseline_raw_crop.png" width="180"> | **Artifacts Visible:** The street lamp is reconstructed, but it is surrounded by "halo" artifacts where the 3D Gaussians expand into the sky region. |
+| **2. Geometry Analysis**<br>(`Composite View`) | <img src="assets/readme_vis/2_alpha_analysis_crop.png" width="180"> | **Alpha Bleeding:** By visualizing `Pixel * Alpha`, we see that the Gaussian ellipsoids physically occupy sky pixels. This "bleeding" creates a cluster of noise around the thin structure. |
+| **3. Standard Diffusion**<br>(`Failure Case`) | <img src="assets/readme_vis/3_diffusion_failure_crop.png" width="180"> | **Object Vanished:** The diffusion model interprets the lamp-plus-artifacts cluster as high-frequency noise. Consequently, it "denoises" the region by erasing the object entirely. |
+| **4. Alpha-Constrained**<br>(`Success Case`) | <img src="assets/readme_vis/4_diffusion_success_crop.png" width="180"> | **Object Preserved:** In this validation experiment, we forcibly penalized alpha values using the sky mask before diffusion (`alpha *= 1-sky`). With artifacts removed, the diffusion model correctly preserves the lamp geometry. |
+
+### Implication
+This analysis demonstrates that simply post-processing the segmentation mask is not enough. The **Alpha Bleeding** phenomenon suggests that future model iterations require a **sky-aware alpha loss** during training to constrain Gaussian opacity within valid object boundaries.
+
 ## Installation
 
 For installation instructions, please refer to the [original DGGT repository](https://github.com/xiaomi-research/dggt).
