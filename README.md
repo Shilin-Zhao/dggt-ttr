@@ -2,7 +2,7 @@
 
 # DGGT-TTR: Robust 4D Reconstruction with Test-Time Refinement
 
-**A robust fork of DGGT featuring precise mask processing and multi-stage test-time optimization.**
+**A robust fork of DGGT featuring precise mask processing, multi-stage test-time optimization, and depth prior integration.**
 
 [Original Paper](https://arxiv.org/abs/2512.03004) | [Original Project Page](https://xiaomi-research.github.io/dggt/)
 
@@ -10,7 +10,7 @@
 
 ## 🚀 Key Enhancements
 
-This repository improves upon the original DGGT implementation by addressing segmentation artifacts and introducing a Test-Time Refinement (TTR) pipeline.
+This repository improves upon the original DGGT implementation by addressing segmentation artifacts, introducing a Test-Time Refinement (TTR) pipeline, and providing a modular codebase for experimentation.
 
 ### 1. Fix: Vanishing Small Objects
 
@@ -31,6 +31,20 @@ Optimizes Gaussian Splatting parameters including:
 - Position (XYZ) and scale (optional, may cause overfitting)
 
 **Note:** While optimizing position and scale achieves the largest quantitative improvements, it may lead to overfitting and artifacts in novel view synthesis (NVS). We recommend validating on held-out viewpoints when using full optimization.
+
+### 3. Feature: Depth Prior Integration (Experimental)
+
+We have integrated logic to utilize **[Depth Anything 3](https://github.com/ByteDance-Seed/Depth-Anything-3)** as a geometric prior. This includes a RANSAC-based alignment and adaptive fusion strategy to constrain the reconstruction using monocular depth cues.
+*(Note: This feature is currently available for experimentation in the provided Jupyter Notebook)*.
+
+## Code Structure
+
+To improve maintainability and facilitate debugging, the codebase has been refactored:
+
+* **`core_pipeline.py`**: Contains the core logic for inference, refinement, and depth fusion.
+* **`vis_utils.py`**: Dedicated utilities for visualization, including depth alignment analysis.
+* **`inference_mode2_view1.ipynb`**: A Jupyter Notebook for interactive debugging, specifically used for tuning the Depth Anything 3 alignment and visualizing the TTR process.
+* **`inference_refine_mode2.py`**: The main command-line script for running the stable TTR pipeline.
 
 ## Quantitative Results
 
@@ -58,10 +72,6 @@ The video below demonstrates the reconstruction stability, specifically focusing
 <div align="center">
   <video src="https://github.com/user-attachments/assets/2c285129-1ede-42e9-b9b7-5b0c4969104e" width="100%" controls autoplay loop muted></video>
 </div>
-
-
-
-
 
 **Observations:**
 * **DGGT (Baseline):** Distant street lamps tend to vanish or flicker due to mask interpolation issues.
@@ -137,9 +147,10 @@ python inference_refine.py \
 - ✅ Implemented pose refinement
 - ✅ Implemented GS attribute refinement
 - ✅ Added support for selective parameter optimization
+- ✅ Integrate [Depth Anything 3](https://depth-anything-3.github.io/) as depth prior for improved geometry
 
 ### Next Steps
-- [ ] Integrate [Depth Anything 3](https://depth-anything-3.github.io/) as depth prior for improved geometry
+- [ ] Evaluate performance on more scenes
 - [ ] Novel view synthesis validation to assess overfitting
 - [ ] Multi-scene evaluation and benchmarking
 

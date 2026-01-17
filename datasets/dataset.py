@@ -11,6 +11,150 @@ from PIL import Image
 from torchvision import transforms as TF
 import numpy as np
 
+
+def load_da3_data_from_npz(npz_path, target_image_path, sky_mask_shape):
+    """
+    Load depth and sky mask from .npz file and match with image file.
+    
+    Args:
+        npz_path: path to .npz file
+        target_image_path: path to target image file to match
+        sky_mask_shape: (H, W) shape of sky mask for validation
+    
+    Returns:
+        depth: torch.Tensor [H, W] depth map
+        sky_mask: torch.Tensor [H, W] sky mask (bool, True=sky)
+        matched: bool, whether the npz file matches the image file
+    """
+    data = np.load(npz_path)
+    
+    # Get source filename from npz
+    # Convert numpy array to string if needed
+    source_filename_raw = data["source_filename"]
+    if isinstance(source_filename_raw, np.ndarray):
+        # Handle numpy array: use item() for scalar, or convert to string
+        if source_filename_raw.ndim == 0:
+            source_filename = str(source_filename_raw.item())
+        else:
+            source_filename = str(source_filename_raw)
+    else:
+        source_filename = str(source_filename_raw)
+    source_filename = os.path.basename(source_filename)
+    target_filename = os.path.basename(target_image_path)
+    
+    # Check if filenames match (without extension)
+    source_name = os.path.splitext(source_filename)[0]
+    target_name = os.path.splitext(target_filename)[0]
+    
+    if source_name != target_name:
+        return None, None, False
+    
+    # Load depth and sky
+    depth = data["depth"]  # [H, W] float32
+    sky = data["sky"]      # [H, W] bool
+    
+    # Assert shape matches sky_mask_shape
+    assert depth.shape == sky_mask_shape, f"DA3 depth shape {depth.shape} does not match sky_mask shape {sky_mask_shape}"
+    assert sky.shape == sky_mask_shape, f"DA3 sky shape {sky.shape} does not match sky_mask shape {sky_mask_shape}"
+    
+    # Convert to torch tensors
+    depth_tensor = torch.from_numpy(depth).float()
+    sky_tensor = torch.from_numpy(sky).bool()
+    
+    return depth_tensor, sky_tensor, True
+
+
+def load_da3_data_for_indices(da3_result_paths, image_paths, indices, sky_mask_shape, views=1):
+    """
+    Load DA3 data for given indices.
+    
+    Args:
+        da3_result_paths: list of npz file paths
+        image_paths: list of image paths (or list of lists for views=3)
+        indices: list of indices to load
+        sky_mask_shape: (H, W) shape of sky mask
+        views: number of views (1 or 3)
+    
+    Returns:
+        da3_depth: torch.Tensor [S, 1, H, W] or [S*3, 1, H, W]
+        da3_sky_mask: torch.Tensor [S, 1, H, W] or [S*3, 1, H, W]
+        success: bool, whether all data was loaded successfully
+    """
+    da3_depths = []
+    da3_sky_masks = []
+    
+    if views == 1:
+        for i in indices:
+            image_path = image_paths[i]
+            matched = False
+            for npz_path in da3_result_paths:
+                depth, sky_mask, matched = load_da3_data_from_npz(
+                    npz_path, image_path, sky_mask_shape
+                )
+                if matched:
+                    da3_depths.append(depth)
+                    da3_sky_masks.append(sky_mask)
+                    break
+            if not matched:
+                print(f"Warning: No matching DA3 npz file for {os.path.basename(image_path)}")
+                return None, None, False
+    else:  # views == 3
+        for i in indices:
+            for v in range(3):
+                image_path = image_paths[v][i]
+                matched = False
+                for npz_path in da3_result_paths:
+                    depth, sky_mask, matched = load_da3_data_from_npz(
+                        npz_path, image_path, sky_mask_shape
+                    )
+                    if matched:
+                        da3_depths.append(depth)
+                        da3_sky_masks.append(sky_mask)
+                        break
+                if not matched:
+                    print(f"Warning: No matching DA3 npz file for {os.path.basename(image_path)}")
+                    return None, None, False
+    
+    # Stack tensors
+    if len(da3_depths) > 0:
+        da3_depth = torch.stack(da3_depths, dim=0)  # [S, H, W] or [S*3, H, W]
+        da3_sky_mask = torch.stack(da3_sky_masks, dim=0)  # [S, H, W] or [S*3, H, W]
+        # Add channel dimension
+        da3_depth = da3_depth.unsqueeze(1)  # [S, 1, H, W] or [S*3, 1, H, W]
+        da3_sky_mask = da3_sky_mask.unsqueeze(1).float()  # [S, 1, H, W] or [S*3, 1, H, W]
+        return da3_depth, da3_sky_mask, True
+    
+    return None, None, False
+
+
+def get_filename_without_ext(filepath):
+    """Extract filename without extension for comparison."""
+    return os.path.splitext(os.path.basename(filepath))[0]
+
+
+def verify_filenames_match(image_paths, da3_paths, data_type="da3_depth"):
+    """Verify that da3 file names match image file names."""
+    if len(image_paths) != len(da3_paths):
+        print(f"Warning: {data_type} file count mismatch: images={len(image_paths)}, {data_type}={len(da3_paths)}")
+        return False
+    
+    mismatches = []
+    for img_path, da3_path in zip(image_paths, da3_paths):
+        img_name = get_filename_without_ext(img_path)
+        da3_name = get_filename_without_ext(da3_path)
+        if img_name != da3_name:
+            mismatches.append((img_path, da3_path, img_name, da3_name))
+    
+    if mismatches:
+        print(f"Warning: {data_type} filename mismatches detected:")
+        for img_path, da3_path, img_name, da3_name in mismatches[:5]:  # Print first 5 mismatches
+            print(f"  Image: {os.path.basename(img_path)} -> {data_type}: {os.path.basename(da3_path)}")
+        if len(mismatches) > 5:
+            print(f"  ... and {len(mismatches) - 5} more mismatches")
+        return False
+    
+    return True
+
 def resize_flow(flow, target_size):
     height, width = flow.shape[-3:-1]
     if (height, width) == target_size:
@@ -183,6 +327,7 @@ class WaymoOpenDataset(Dataset):
         self.semantic_mask_path = []
         self.depth_flow_paths = []
         self.ego_paths = []
+        self.da3_result_paths = []  # Store paths to .npz files in da3_result folder
 
         self.start_idx = start_idx
 
@@ -317,6 +462,24 @@ class WaymoOpenDataset(Dataset):
                         self.semantic_mask_path.append(views_sem_lists)
                 else:
                     self.semantic_mask_path.append([] if self.views == 1 else [[] for _ in range(3)])
+                
+                # da3_result (npz files containing depth and sky mask)
+                da3_result_path = os.path.join(image_dir, scene_name, "da3_result")
+                if os.path.isdir(da3_result_path):
+                    # Get all .npz files
+                    npz_files = sorted([f for f in os.listdir(da3_result_path) if f.endswith(".npz")])
+                    if self.views == 1:
+                        # For views=1, we need to match npz files with image files by source_filename
+                        # We'll store the npz file paths and match them in __getitem__
+                        da3_result_paths = [os.path.join(da3_result_path, f) for f in npz_files]
+                        self.da3_result_paths.append(da3_result_paths)
+                    elif self.views == 3:
+                        # For views=3, we need to organize by view
+                        # We'll need to match by source_filename in __getitem__
+                        da3_result_paths = [os.path.join(da3_result_path, f) for f in npz_files]
+                        self.da3_result_paths.append(da3_result_paths)
+                else:
+                    self.da3_result_paths.append([])
 
 
     def __len__(self):
@@ -327,6 +490,7 @@ class WaymoOpenDataset(Dataset):
         sky_mask_paths = self.sky_mask_paths[idx]
         dynamic_mask_paths = self.dynamic_mask_path[idx]
         semantic_mask_paths = self.semantic_mask_path[idx]
+        da3_result_paths = self.da3_result_paths[idx]
 
         start_idx = random.randint(0, max(1, len(image_paths[0] if self.views == 3 else image_paths) - 21))
 
@@ -387,6 +551,63 @@ class WaymoOpenDataset(Dataset):
                     dynamic_mask = load_and_preprocess_images(dy_mask_seq)  # [S*3, C, H, W]
                 input_dict["dynamic_mask"] = dynamic_mask
 
+            # da3_result (load from .npz files)
+            if len(da3_result_paths) > 0:
+                da3_depths = []
+                da3_sky_masks = []
+                
+                if self.views == 1:
+                    for i in indices:
+                        image_path = image_paths[i]
+                        # Find matching npz file
+                        matched = False
+                        for npz_path in da3_result_paths:
+                            depth, sky_mask, matched = load_da3_data_from_npz(
+                                npz_path, image_path, (sky_mask_h, sky_mask_w)
+                            )
+                            if matched:
+                                da3_depths.append(depth)
+                                da3_sky_masks.append(sky_mask)
+                                break
+                        if not matched:
+                            print(f"Warning: No matching DA3 npz file for {os.path.basename(image_path)}")
+                    
+                    if len(da3_depths) == len(indices):
+                        # Stack to [S, H, W]
+                        da3_depth = torch.stack(da3_depths, dim=0)  # [S, H, W]
+                        da3_sky_mask = torch.stack(da3_sky_masks, dim=0)  # [S, H, W]
+                        # Add channel dimension for consistency: [S, 1, H, W]
+                        da3_depth = da3_depth.unsqueeze(1)  # [S, 1, H, W]
+                        da3_sky_mask = da3_sky_mask.unsqueeze(1).float()  # [S, 1, H, W]
+                        input_dict["da3_depth"] = da3_depth
+                        input_dict["da3_sky_mask"] = da3_sky_mask
+                        
+                elif self.views == 3:
+                    for i in indices:
+                        for v in range(3):
+                            image_path = image_paths[v][i]
+                            # Find matching npz file
+                            matched = False
+                            for npz_path in da3_result_paths:
+                                depth, sky_mask, matched = load_da3_data_from_npz(
+                                    npz_path, image_path, (sky_mask_h, sky_mask_w)
+                                )
+                                if matched:
+                                    da3_depths.append(depth)
+                                    da3_sky_masks.append(sky_mask)
+                                    break
+                            if not matched:
+                                print(f"Warning: No matching DA3 npz file for {os.path.basename(image_path)}")
+                    
+                    if len(da3_depths) == len(indices) * 3:
+                        # Stack to [S*3, H, W]
+                        da3_depth = torch.stack(da3_depths, dim=0)  # [S*3, H, W]
+                        da3_sky_mask = torch.stack(da3_sky_masks, dim=0)  # [S*3, H, W]
+                        # Add channel dimension: [S*3, 1, H, W]
+                        da3_depth = da3_depth.unsqueeze(1)  # [S*3, 1, H, W]
+                        da3_sky_mask = da3_sky_mask.unsqueeze(1).float()  # [S*3, 1, H, W]
+                        input_dict["da3_depth"] = da3_depth
+                        input_dict["da3_sky_mask"] = da3_sky_mask
             
             # if len(semantic_mask_paths) > 0:
             #     if self.views == 1:
@@ -436,6 +657,7 @@ class WaymoOpenDataset(Dataset):
                 mask_seq = [sky_mask_paths[i] for i in indices]
                 masks = load_and_preprocess_images(mask_seq)  # [S, C, H, W]
                 nearest_masks = load_and_preprocess_images(mask_seq, resample_method=Image.Resampling.NEAREST)  # [S, C, H, W]
+                sky_mask_h, sky_mask_w = nearest_masks.shape[2], nearest_masks.shape[3]
             elif self.views == 3:
                 mask_seq = []
                 for i in indices:
@@ -443,6 +665,7 @@ class WaymoOpenDataset(Dataset):
                         mask_seq.append(sky_mask_paths[v][i])
                 masks = load_and_preprocess_images(mask_seq)  # [S*3, C, H, W]
                 nearest_masks = load_and_preprocess_images(mask_seq, resample_method=Image.Resampling.NEAREST)  # [S*3, C, H, W]
+                sky_mask_h, sky_mask_w = nearest_masks.shape[2], nearest_masks.shape[3]
                 
 
 
@@ -492,6 +715,15 @@ class WaymoOpenDataset(Dataset):
                 else:
                     depth_data = torch.zeros(len(indices) * 3, images.shape[2], images.shape[3])
                 input_dict["gt_depth"] = depth_data
+
+            # da3_result (load from .npz files)
+            if len(da3_result_paths) > 0:
+                da3_depth, da3_sky_mask, success = load_da3_data_for_indices(
+                    da3_result_paths, image_paths, indices, (sky_mask_h, sky_mask_w), self.views
+                )
+                if success:
+                    input_dict["da3_depth"] = da3_depth
+                    input_dict["da3_sky_mask"] = da3_sky_mask
 
             return input_dict
 
@@ -617,4 +849,27 @@ class WaymoOpenDataset(Dataset):
                 else:
                     target_depth_data = torch.zeros(len(target_indices) * 3, images.shape[2], images.shape[3])
                 input_dict["gt_depth"] = target_depth_data
+
+            # da3_result (load from .npz files, use target_indices for mode 3)
+            if len(da3_result_paths) > 0:
+                # Get sky mask shape from target masks
+                if self.views == 1:
+                    target_mask_seq = [sky_mask_paths[i] for i in target_indices]
+                    target_nearest_masks = load_and_preprocess_images(target_mask_seq, resample_method=Image.Resampling.NEAREST)
+                    target_sky_mask_h, target_sky_mask_w = target_nearest_masks.shape[2], target_nearest_masks.shape[3]
+                else:
+                    target_mask_seq = []
+                    for i in target_indices:
+                        for v in range(3):
+                            target_mask_seq.append(sky_mask_paths[v][i])
+                    target_nearest_masks = load_and_preprocess_images(target_mask_seq, resample_method=Image.Resampling.NEAREST)
+                    target_sky_mask_h, target_sky_mask_w = target_nearest_masks.shape[2], target_nearest_masks.shape[3]
+                
+                da3_depth, da3_sky_mask, success = load_da3_data_for_indices(
+                    da3_result_paths, image_paths, target_indices, (target_sky_mask_h, target_sky_mask_w), self.views
+                )
+                if success:
+                    input_dict["da3_depth"] = da3_depth
+                    input_dict["da3_sky_mask"] = da3_sky_mask
+
             return input_dict
