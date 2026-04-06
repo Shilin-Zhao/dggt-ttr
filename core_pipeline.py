@@ -1,15 +1,20 @@
 import os
 import time
+import glob
+import logging
+from collections import deque
 import torch
 import torch.nn.functional as F
 import numpy as np
-from dataclasses import dataclass
+import cv2
+from dataclasses import dataclass, replace
 from torch.utils.data import DataLoader
 from torch.optim import Adam
 from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 import lpips
 from kornia.geometry.conversions import axis_angle_to_rotation_matrix
 from kornia.losses import ssim_loss
+from tqdm import tqdm
 
 # Project Specific Imports
 # 确保你的环境能找到这些包
@@ -20,6 +25,7 @@ from dggt.utils.gs import concat_list, get_split_gs
 from gsplat.rendering import rasterization
 from dggt.models.vggt import VGGT
 from sklearn.linear_model import RANSACRegressor
+from vis_utils import compute_color_gradient_map
 
 @dataclass
 class DGGTConfig:
@@ -55,12 +61,12 @@ class DGGTConfig:
     
     # --- Learning Rates ---
     penalize_alphas:bool = False
-    refine_lr_pose: float = 0.0001
-    refine_lr_opacity: float = 0.003
-    refine_lr_color: float = 0.003
-    refine_lr_rot: float = 0.001
-    refine_lr_scales: float = 0.
-    refine_lr_xyz: float = 0.0001
+    refine_lr_pose: float = 1e-4
+    refine_lr_opacity: float = 1e-3
+    refine_lr_color: float = 1e-3
+    refine_lr_rot: float = 1e-3
+    refine_lr_scales: float = 3e-5
+    refine_lr_xyz: float = 3e-5
     force_refresh: bool = False
 
 
@@ -157,6 +163,223 @@ def alpha_t(t, t0, alpha, gamma0=1, gamma1=0.1):
     conf = torch.exp(sigma*(t0-t)**2)
     alpha_ = alpha * conf
     return alpha_.float()
+
+
+def _concat_gaussian_chunks(chunks):
+    """Concatenate gaussian chunks; keep schema even when empty."""
+    if len(chunks) == 0:
+        empty = torch.empty(0, dtype=torch.float32)
+        return {
+            "points": torch.empty(0, 3, dtype=torch.float32),
+            "rgbs": torch.empty(0, 3, dtype=torch.float32),
+            "opacity": empty,
+            "scales": torch.empty(0, 3, dtype=torch.float32),
+            "rotations": torch.empty(0, 4, dtype=torch.float32),
+        }
+    return {
+        "points": torch.cat([c["points"] for c in chunks], dim=0),
+        "rgbs": torch.cat([c["rgbs"] for c in chunks], dim=0),
+        "opacity": torch.cat([c["opacity"] for c in chunks], dim=0),
+        "scales": torch.cat([c["scales"] for c in chunks], dim=0),
+        "rotations": torch.cat([c["rotations"] for c in chunks], dim=0),
+    }
+
+
+def build_gaussians_for_export(ply_payload, logical_frame_idx):
+    """
+    Build static/dynamic gaussian tensors for one logical frame.
+
+    For views=3, a logical frame maps to 3 flattened indices and merges them.
+    """
+    views = int(ply_payload.get("views", 1))
+    if views not in (1, 3):
+        raise ValueError(f"Unsupported views={views}. Only 1 or 3 are supported.")
+
+    timestamps_flat = ply_payload["timestamps_flat"]
+    num_flat_frames = int(timestamps_flat.shape[0])
+    if num_flat_frames % views != 0:
+        raise ValueError(
+            f"Inconsistent payload: num_flat_frames={num_flat_frames} is not divisible by views={views}."
+        )
+    num_logical_frames = num_flat_frames // views
+    if logical_frame_idx < 0 or logical_frame_idx >= num_logical_frames:
+        raise IndexError(
+            f"logical_frame_idx={logical_frame_idx} out of range [0, {num_logical_frames - 1}]"
+        )
+
+    if views == 1:
+        flat_indices = [logical_frame_idx]
+    else:
+        base = logical_frame_idx * views
+        flat_indices = [base + i for i in range(views)]
+
+    static_base = ply_payload["static_base"]
+    dynamic_chunks = []
+    dynamic_per_flat_frame = ply_payload["dynamic_per_flat_frame"]
+
+    # Static should be exported once per logical frame.
+    # For views=3, timestamps are repeated as [f0v0, f0v1, f0v2], so we use the first.
+    t0 = timestamps_flat[flat_indices[0]]
+    static_opacity_t = alpha_t(
+        static_base["gs_timestamps"],
+        t0,
+        static_base["opacity"],
+        gamma0=static_base["gs_conf"],
+    )
+    static_export = {
+        "points": static_base["points"],
+        "rgbs": static_base["rgbs"],
+        "opacity": static_opacity_t,
+        "scales": static_base["scales"],
+        "rotations": static_base["rotations"],
+    }
+
+    for flat_idx in flat_indices:
+        dynamic_chunks.append(dynamic_per_flat_frame[flat_idx])
+
+    dynamic_export = _concat_gaussian_chunks(dynamic_chunks)
+    return static_export, dynamic_export
+
+
+def _write_gaussians_to_ply_ascii(gaussians, ply_path):
+    """Write gaussian attributes to an ASCII PLY with custom properties."""
+    points = gaussians["points"]
+    rgbs = gaussians["rgbs"]
+    opacity = gaussians["opacity"]
+    scales = gaussians["scales"]
+    rotations = gaussians["rotations"]
+
+    num_points = int(points.shape[0])
+
+    if isinstance(points, torch.Tensor):
+        points = points.detach().cpu().numpy()
+    if isinstance(rgbs, torch.Tensor):
+        rgbs = rgbs.detach().cpu().numpy()
+    if isinstance(opacity, torch.Tensor):
+        opacity = opacity.detach().cpu().numpy()
+    if isinstance(scales, torch.Tensor):
+        scales = scales.detach().cpu().numpy()
+    if isinstance(rotations, torch.Tensor):
+        rotations = rotations.detach().cpu().numpy()
+
+    rgbs = np.clip(rgbs, 0.0, 1.0).astype(np.float32)
+
+    header = [
+        "ply",
+        "format ascii 1.0",
+        f"element vertex {num_points}",
+        "property float x",
+        "property float y",
+        "property float z",
+        "property float f_dc_0",
+        "property float f_dc_1",
+        "property float f_dc_2",
+        "property float opacity",
+        "property float scale_0",
+        "property float scale_1",
+        "property float scale_2",
+        "property float rot_0",
+        "property float rot_1",
+        "property float rot_2",
+        "property float rot_3",
+        "end_header",
+    ]
+
+    with open(ply_path, "w") as f:
+        f.write("\n".join(header) + "\n")
+        for i in range(num_points):
+            x, y, z = points[i]
+            f0, f1, f2 = rgbs[i]
+            op = float(opacity[i])
+            s0, s1, s2 = scales[i]
+            q0, q1, q2, q3 = rotations[i]
+            f.write(
+                f"{x:.7f} {y:.7f} {z:.7f} "
+                f"{f0:.7f} {f1:.7f} {f2:.7f} "
+                f"{op:.7f} {s0:.7f} {s1:.7f} {s2:.7f} "
+                f"{q0:.7f} {q1:.7f} {q2:.7f} {q3:.7f}\n"
+            )
+
+
+def _filter_gaussians_by_opacity(gaussians, min_opacity):
+    """Filter gaussian attributes by opacity threshold."""
+    opacity = gaussians["opacity"]
+    threshold = float(min_opacity)
+    if isinstance(opacity, torch.Tensor):
+        mask = (opacity.reshape(-1) >= threshold)
+    else:
+        mask = (np.asarray(opacity).reshape(-1) >= threshold)
+
+    filtered = {}
+    for key, value in gaussians.items():
+        if isinstance(value, torch.Tensor):
+            value_mask = mask.to(device=value.device) if isinstance(mask, torch.Tensor) else torch.from_numpy(mask).to(device=value.device)
+            filtered[key] = value[value_mask]
+        else:
+            np_value = np.asarray(value)
+            np_mask = mask.detach().cpu().numpy() if isinstance(mask, torch.Tensor) else mask
+            filtered[key] = np_value[np_mask]
+    return filtered
+
+
+def save_gaussians_payload_to_ply(
+    ply_payload,
+    frame_indices,
+    output_dir,
+    scene_name,
+    logger=None,
+    min_opacity=0.0,
+):
+    """
+    Export static/dynamic gaussians for selected logical frames.
+
+    Args:
+        min_opacity (float): keep gaussians with opacity >= min_opacity.
+
+    Returns:
+        List[dict]: file paths and point counts per frame.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    exported = []
+
+    if frame_indices is None:
+        raise ValueError("frame_indices must be provided, e.g. [0, 5].")
+    if not isinstance(frame_indices, (list, tuple)):
+        raise TypeError("frame_indices must be a list/tuple of logical frame indices.")
+    if len(frame_indices) == 0:
+        raise ValueError("frame_indices is empty.")
+    if min_opacity is None:
+        raise ValueError("min_opacity must be a number.")
+    min_opacity = float(min_opacity)
+
+    for logical_idx in frame_indices:
+        static_export, dynamic_export = build_gaussians_for_export(ply_payload, int(logical_idx))
+        static_export = _filter_gaussians_by_opacity(static_export, min_opacity)
+        dynamic_export = _filter_gaussians_by_opacity(dynamic_export, min_opacity)
+
+        static_path = os.path.join(output_dir, f"scene_{scene_name}_frame_{logical_idx}_static.ply")
+        dynamic_path = os.path.join(output_dir, f"scene_{scene_name}_frame_{logical_idx}_dynamic.ply")
+
+        _write_gaussians_to_ply_ascii(static_export, static_path)
+        _write_gaussians_to_ply_ascii(dynamic_export, dynamic_path)
+
+        record = {
+            "frame_idx": int(logical_idx),
+            "static_path": static_path,
+            "dynamic_path": dynamic_path,
+            "static_count": int(static_export["points"].shape[0]),
+            "dynamic_count": int(dynamic_export["points"].shape[0]),
+        }
+        exported.append(record)
+        if logger is not None:
+            logger.info(
+                f"Exported frame {logical_idx} (min_opacity={min_opacity}): "
+                f"static={record['static_count']} -> {static_path}, "
+                f"dynamic={record['dynamic_count']} -> {dynamic_path}"
+            )
+            if record["dynamic_count"] == 0:
+                logger.warning(f"Frame {logical_idx} has empty dynamic gaussians.")
+    return exported
 
 
 # ========== Lie Algebra Utilities ==========
@@ -510,7 +733,7 @@ def compute_metrics(img1, img2, loss_fn):
     return sum(psnr_list) / len(psnr_list), sum(ssim_list) / len(ssim_list), sum(lpips_list) / len(lpips_list)
 
 # --- Main Pipeline Function ---
-def run_inference_and_render(config, model, dataset, logger, device='cuda'):
+def run_inference_and_render(config, model, dataset, logger, device='cuda', return_ply=False):
     """
     Run the full DGGT inference and rendering pipeline.
     Returns a list of dictionaries containing results for each scene in the dataset.
@@ -616,8 +839,11 @@ def run_inference_and_render(config, model, dataset, logger, device='cuda'):
                         m_da3 = da3_sky_mask[0, t, 0].detach().cpu().numpy()  # [B, T, 1, H, W] -> [H, W]
                         
                         # Process single frame
+                        img_np = images[0, t].detach().cpu().permute(1, 2, 0).numpy()
                         d_final, m_final, _ = process_depth_fusion_single_frame(
-                            d_dggt, d_da3, m_dggt, m_da3, logger
+                            d_dggt, d_da3, m_dggt, m_da3,
+                            image_np=img_np,
+                            logger=logger
                         )
                         
                         depth_final_list.append(d_final)
@@ -700,54 +926,54 @@ def run_inference_and_render(config, model, dataset, logger, device='cuda'):
                 extrinsic, intrinsic, H, W, model.sky_model, images, config.penalize_alphas, sky_mask=sky_mask
             )
 
-        # 5. Refinement Logic (if enabled, directly overwrite variables)
-        if config.enable_refinement and refiner is not None:
-            logger.info("Starting Test-Time Refinement...")
+            # 5. Refinement Logic (if enabled, directly overwrite variables)
+            if config.enable_refinement and refiner is not None:
+                logger.info("Starting Test-Time Refinement...")
+                
+                with torch.enable_grad():
+                    extrinsic, static_gs = refiner.forward(
+                        gt_images=target_image,
+                        static_gs=static_gs,
+                        dynamic_gs_list=dynamic_gs_list,
+                        timestamps=timestamps,
+                        gs_timestamps=gs_timestamps,
+                        extrinsic=extrinsic,
+                        intrinsic=intrinsic,
+                        H=H, W=W,
+                        sky_model=model.sky_model,
+                        images=images,
+                        sky_mask=sky_mask[0],
+                        dynamic_mask=gt_dy_map[0] if gt_dy_map is not None else None
+                    )
+                
+                # Re-render with optimized results
+                logger.info("Rendering final frames (after refinement)...")
+                with torch.no_grad():
+                    rendered_image, depth_maps, alphas = render_all_frames(
+                        static_gs, dynamic_gs_list, timestamps, gs_timestamps,
+                        extrinsic, intrinsic, H, W, model.sky_model, images, config.penalize_alphas, sky_mask=sky_mask
+                    )
             
-            with torch.enable_grad():
-                extrinsic, static_gs = refiner.forward(
-                    gt_images=target_image,
-                    static_gs=static_gs,
-                    dynamic_gs_list=dynamic_gs_list,
-                    timestamps=timestamps,
-                    gs_timestamps=gs_timestamps,
-                    extrinsic=extrinsic,
-                    intrinsic=intrinsic,
-                    H=H, W=W,
-                    sky_model=model.sky_model,
-                    images=images,
-                    sky_mask=sky_mask[0],
-                    dynamic_mask=gt_dy_map[0] if gt_dy_map is not None else None
-                )
+            # 6. Apply Diffusion (if enabled, directly overwrite rendered_image)
+            if config.diffusion:
+                logger.info("Applying diffusion")
+                rendered_image = apply_diffusion(rendered_image, "/root/autodl-tmp/dggt-ttr/pretrained/diffusion_model.pth", device)
+                
+            # 7. Compute Metrics (if enabled)
+            metrics = None
+            if config.metrics and loss_fn is not None:
+                psnr, ssim, lpip = compute_metrics(rendered_image, target_image, loss_fn)
+                metrics = {
+                    'psnr': psnr,
+                    'ssim': ssim,
+                    'lpips': lpip
+                }
+                psnr_list.append(psnr)
+                ssim_list.append(ssim)
+                lpips_list.append(lpip)
+                logger.info(f"Scene {scene_name} Metrics: PSNR={psnr:.4f}, SSIM={ssim:.4f}, LPIPS={lpip:.4f}")
             
-            # Re-render with optimized results
-            logger.info("Rendering final frames (after refinement)...")
-            with torch.no_grad():
-                rendered_image, depth_maps, alphas = render_all_frames(
-                    static_gs, dynamic_gs_list, timestamps, gs_timestamps,
-                    extrinsic, intrinsic, H, W, model.sky_model, images, config.penalize_alphas, sky_mask=sky_mask
-                )
-        
-        # 6. Apply Diffusion (if enabled, directly overwrite rendered_image)
-        if config.diffusion:
-            logger.info("Applying diffusion")
-            rendered_image = apply_diffusion(rendered_image, "/root/autodl-tmp/dggt-ttr/pretrained/diffusion_model.pth", device)
-            
-        # 7. Compute Metrics (if enabled)
-        metrics = None
-        if config.metrics and loss_fn is not None:
-            psnr, ssim, lpip = compute_metrics(rendered_image, target_image, loss_fn)
-            metrics = {
-                'psnr': psnr,
-                'ssim': ssim,
-                'lpips': lpip
-            }
-            psnr_list.append(psnr)
-            ssim_list.append(ssim)
-            lpips_list.append(lpip)
-            logger.info(f"Scene {scene_name} Metrics: PSNR={psnr:.4f}, SSIM={ssim:.4f}, LPIPS={lpip:.4f}")
-        
-        # 8. Collect Results
+            # 8. Collect Results (无论是否计算 metrics 都需要收集结果)
             scene_result = {
                 'scene_name': scene_name,
                 'rendered_image': rendered_image.detach().cpu(),  # [T, C, H, W]
@@ -758,10 +984,35 @@ def run_inference_and_render(config, model, dataset, logger, device='cuda'):
                 'masks': batch['masks'].cpu(), # Keep original masks for vis
                 'nearest_masks': batch['nearest_masks'].cpu()
             }
+            if return_ply:
+                dynamic_per_flat_frame = []
+                for dyn in dynamic_gs_list:
+                    dynamic_per_flat_frame.append({
+                        'points': dyn['points'].detach().cpu(),
+                        'rgbs': dyn['rgbs'].detach().cpu(),
+                        'opacity': dyn['opacity'].detach().cpu(),
+                        'scales': dyn['scales'].detach().cpu(),
+                        'rotations': dyn['rotations'].detach().cpu(),
+                    })
+                scene_result['ply_payload'] = {
+                    'views': int(getattr(config, "input_views", 1)),
+                    'timestamps_flat': timestamps.detach().cpu(),
+                    'dynamic_per_flat_frame': dynamic_per_flat_frame,
+                    'static_base': {
+                        'points': static_gs['points'].detach().cpu(),
+                        'rgbs': static_gs['rgbs'].detach().cpu(),
+                        'opacity': static_gs['opacity'].detach().cpu(),
+                        'scales': static_gs['scales'].detach().cpu(),
+                        'rotations': static_gs['rotations'].detach().cpu(),
+                        'gs_conf': static_gs['gs_conf'].detach().cpu(),
+                        'gs_timestamps': gs_timestamps.detach().cpu(),
+                    },
+                }
             if da3_depth is not None:
                 scene_result['da3_depth'] = da3_depth.detach().cpu()
-        if metrics is not None:
-            scene_result['metrics'] = metrics
+            if metrics is not None:
+                scene_result['metrics'] = metrics
+            
             results.append(scene_result)
             logger.info(f"Scene {scene_name} processed. Inference time: {time.time() - start_time:.2f}s")
     
@@ -870,6 +1121,7 @@ def run_depth_alignment_debug(
     sample_indices, 
     dggt_depth_seq, dggt_sky_seq, 
     da3_depth_seq, da3_sky_seq,
+    dataset=None,
     logger=None, visualize_func=None
 ):
     """
@@ -877,6 +1129,12 @@ def run_depth_alignment_debug(
     """
     seq_len = dggt_depth_seq.shape[0]
     
+    # 获取图像数据序列 (如果有传 dataset)
+    image_seq = None
+    if dataset is not None:
+        batch_data = dataset[0] # 取第一批数据
+        image_seq = batch_data['images'] # [S, C, H, W]
+
     for t in sample_indices:
         if t >= seq_len: 
             if logger: logger.info(f"Frame {t} out of bounds, skipping.")
@@ -891,8 +1149,19 @@ def run_depth_alignment_debug(
         m_da3 = da3_sky_seq[t].detach().cpu().numpy()
         
         # 2. 核心融合逻辑 (调用你之前定义的 process_depth_fusion_single_frame)
+        img_np = None
+        if image_seq is not None:
+            img_t = image_seq[t] # [C, H, W]
+            if hasattr(img_t, "detach"):
+                # 转成 [H, W, C] 格式
+                img_np = img_t.detach().cpu().permute(1, 2, 0).numpy()
+            else:
+                img_np = np.asarray(img_t)
+
         d_final, m_final, d_da3_aligned = process_depth_fusion_single_frame(
-            d_dggt, d_da3, m_dggt, m_da3, logger
+            d_dggt, d_da3, m_dggt, m_da3,
+            image_np=img_np,
+            logger=logger
         )
         
         # 3. 可视化
@@ -949,9 +1218,112 @@ def extract_depth_alignment_data(config, model, dataset, device='cuda'):
     return dggt_depth_tensor, dggt_sky_seq, da3_depth_seq, da3_sky_seq
 
 
+def compute_color_gradient_magnitude(image_np):
+    """
+    统一复用 vis_utils.py 中的梯度实现，避免调试图和实际融合逻辑不一致。
+    """
+    if image_np is None:
+        return None
+
+    img = image_np
+    if img.ndim == 3 and img.shape[0] in (1, 3, 4) and img.shape[-1] not in (1, 3, 4):
+        img = np.transpose(img, (1, 2, 0))
+    elif img.ndim == 2:
+        img = img[..., None]
+
+    if img.ndim != 3:
+        return None
+
+    return compute_color_gradient_map(img)
+
+
+def extract_top_connected_sky_seed(sure_sky_mask):
+    """
+    仅提取与图像上边界连通的 sure_sky，作为天空扩张种子。
+    """
+    sure_sky_mask = np.asarray(sure_sky_mask, dtype=bool)
+    if sure_sky_mask.ndim != 2 or not sure_sky_mask.any():
+        return np.zeros_like(sure_sky_mask, dtype=bool)
+
+    h, w = sure_sky_mask.shape
+    seed_mask = np.zeros((h, w), dtype=bool)
+    queue = deque()
+
+    top_cols = np.where(sure_sky_mask[0])[0]
+    for x in top_cols:
+        seed_mask[0, x] = True
+        queue.append((0, x))
+
+    neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+    while queue:
+        y, x = queue.popleft()
+        for dy, dx in neighbors:
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < h and 0 <= nx < w and sure_sky_mask[ny, nx] and not seed_mask[ny, nx]:
+                seed_mask[ny, nx] = True
+                queue.append((ny, nx))
+
+    return seed_mask
+
+
+def expand_sky_through_low_gradient(top_sky_seed, unknown_mask, grad_mag, grad_thresh):
+    """
+    天空从外往内扩张：
+    只允许从 top-connected sky seed 穿过低梯度的 unknown 区域。
+    未被扩张到的 unknown 将在后续全部视为物体。
+    """
+    top_sky_seed = np.asarray(top_sky_seed, dtype=bool)
+    unknown_mask = np.asarray(unknown_mask, dtype=bool)
+    if not top_sky_seed.any() or not unknown_mask.any():
+        return np.zeros_like(unknown_mask, dtype=bool)
+
+    h, w = unknown_mask.shape
+    expanded_sky = np.zeros((h, w), dtype=bool)
+    visited = top_sky_seed.copy()
+    queue = deque([tuple(idx) for idx in np.argwhere(top_sky_seed)])
+    neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+
+    while queue:
+        y, x = queue.popleft()
+        for dy, dx in neighbors:
+            ny, nx = y + dy, x + dx
+            if not (0 <= ny < h and 0 <= nx < w):
+                continue
+            if visited[ny, nx]:
+                continue
+            if unknown_mask[ny, nx] and grad_mag[ny, nx] <= grad_thresh:
+                expanded_sky[ny, nx] = True
+                visited[ny, nx] = True
+                queue.append((ny, nx))
+            elif unknown_mask[ny, nx]:
+                visited[ny, nx] = True
+            elif not unknown_mask[ny, nx]:
+                visited[ny, nx] = True
+
+    return expanded_sky
+
+
+def build_edge_barrier(unknown_mask, grad_mag, grad_thresh, dilate_kernel_size=3):
+    """
+    在争议区内构造高梯度屏障，避免天空从电线杆边缘的缝隙漏进来。
+    """
+    unknown_mask = np.asarray(unknown_mask, dtype=bool)
+    if not unknown_mask.any():
+        return np.zeros_like(unknown_mask, dtype=bool)
+
+    edge_barrier = unknown_mask & (grad_mag >= grad_thresh)
+    if edge_barrier.any() and dilate_kernel_size > 1:
+        kernel = np.ones((dilate_kernel_size, dilate_kernel_size), dtype=np.uint8)
+        edge_barrier = cv2.dilate(edge_barrier.astype(np.uint8), kernel, iterations=1).astype(bool)
+        edge_barrier = edge_barrier & unknown_mask
+
+    return edge_barrier
+
+
 def process_depth_fusion_single_frame(
     dggt_depth_np, da3_depth_np, 
     nearest_sky_mask_np, da3_sky_mask_np,
+    image_np=None,
     logger=None
 ):
     """
@@ -970,42 +1342,371 @@ def process_depth_fusion_single_frame(
     is_dggt_obj = (nearest_sky_mask_np == 0) # True = Object
     is_da3_obj = (da3_sky_mask_np == 0)      # True = Object
     
-    consensus_mask = is_dggt_obj & is_da3_obj # [H, W] Boolean
+    sure_obj = is_dggt_obj & is_da3_obj      # 双方都认为是物体
+    sure_sky = (~is_dggt_obj) & (~is_da3_obj) # 双方都认为是天空
+    unknown_mask = is_dggt_obj ^ is_da3_obj   # 有分歧的区域
     
     # 3. 对齐 (Alignment)
-    da3_aligned, s, t = align_depth_disparity(dggt_depth_np, da3_depth_np, consensus_mask)
+    da3_aligned, s, t = align_depth_disparity(dggt_depth_np, da3_depth_np, sure_obj)
     
     if logger:
         logger.info(f"  Alignment: Scale={s:.4f}, Shift={t:.4f}")
 
-    # 4. 融合 (Merge Logic)
+    # 4. 融合 Sky Mask：
+    # sure_sky / sure_obj 保持不变；
+    # unknown 仅允许从上边界连通的天空种子穿过低梯度区域向内扩张；
+    # 扩张不到的 unknown 统一视为物体。
+    expanded_sky = np.zeros_like(sure_sky, dtype=bool)
+    grad_thresh = 0.12
+    if image_np is not None and unknown_mask.any():
+        grad_mag = compute_color_gradient_magnitude(image_np)
+        if grad_mag is not None:
+            top_sky_seed = extract_top_connected_sky_seed(sure_sky)
+            edge_barrier = build_edge_barrier(
+                unknown_mask=unknown_mask,
+                grad_mag=grad_mag,
+                grad_thresh=grad_thresh,
+                dilate_kernel_size=3
+            )
+            passable_unknown = unknown_mask & (~edge_barrier)
+            expanded_sky = expand_sky_through_low_gradient(
+                top_sky_seed=top_sky_seed,
+                unknown_mask=passable_unknown,
+                grad_mag=grad_mag,
+                grad_thresh=grad_thresh
+            )
+            if logger:
+                logger.info(
+                    f"  Unknown refined by sky expansion: "
+                    f"unknown={int(unknown_mask.sum())}, "
+                    f"top_seed={int(top_sky_seed.sum())}, "
+                    f"edge_barrier={int(edge_barrier.sum())}, "
+                    f"expanded_sky={int(expanded_sky.sum())}, "
+                    f"grad_thresh={grad_thresh:.3f}"
+                )
+
+    final_sky = sure_sky | expanded_sky
+    final_mask_obj = ~final_sky
+
+    # 5. winner-takes-depth：
+    # 最终标签与哪一方一致，就采用哪一方的深度。
+    follow_da3 = (final_mask_obj == is_da3_obj)
     final_depth = dggt_depth_np.copy()
-    
-    # 基于深度的天空区域判断：找出天空区域的深度5%分位数
-    # 如果某个像素的深度比这个分位数的90%都远（深度值更大），认为是天空，不覆盖DGGT深度
-    is_da3_sky = (da3_sky_mask_np > 0)  # True = Sky
-    if is_da3_sky.any():
-        # 使用对齐后的DA3深度在天空区域的深度值
-        da3_sky_depths = da3_aligned[is_da3_sky]
-        if len(da3_sky_depths) > 0:
-            sky_percentile_5 = np.percentile(da3_sky_depths, 5)
-            # 比天空5%分位数的90%都远 = 深度 > 天空5%分位数 / 0.9
-            sky_threshold = sky_percentile_5 / 0.9
-            # 如果深度比阈值还远（深度值更大），认为是天空，不覆盖
-            is_sky_by_depth = da3_aligned > sky_threshold
-        else:
-            is_sky_by_depth = np.zeros_like(da3_aligned, dtype=bool)
-    else:
-        is_sky_by_depth = np.zeros_like(da3_aligned, dtype=bool)
-    
-    # 更新区域: DA3 认为是物体 且 不是天空（基于深度判断）
-    update_mask = is_da3_obj & (~is_sky_by_depth)
-    
-    final_depth[update_mask] = da3_aligned[update_mask]
-    
-    # 5. 生成 Final Mask (1=Sky, 0=Object)
-    # 保守策略: 只要任意一方认为是物体，就认为是物体 (避免把物体当天空)
-    final_mask_obj = is_dggt_obj | is_da3_obj 
-    final_sky_mask = (~final_mask_obj).astype(np.uint8) # 1=Sky
+    final_depth[follow_da3] = da3_aligned[follow_da3]
+
+    # 6. 生成 Final Mask (1=Sky, 0=Object)
+    final_sky_mask = final_sky.astype(np.uint8) # 1=Sky
     
     return final_depth, final_sky_mask, da3_aligned
+
+
+# -----------------------------------------------------------------------------
+# Full Sequence Inference Utilities
+# -----------------------------------------------------------------------------
+
+class FileLogger:
+    """
+    Logger that outputs to both console and file.
+    Each scene can have its own log file.
+    """
+    def __init__(self, log_dir, scene_name, console_output=True):
+        """
+        Args:
+            log_dir: Directory to save log files
+            scene_name: Scene identifier for the log file name
+            console_output: Whether to also print to console
+        """
+        os.makedirs(log_dir, exist_ok=True)
+        self.log_path = os.path.join(log_dir, f"scene_{scene_name}.log")
+        self.console_output = console_output
+        
+        # Create/clear the log file
+        with open(self.log_path, 'w') as f:
+            f.write(f"=== Log for Scene {scene_name} ===\n")
+            f.write(f"Started at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("=" * 60 + "\n\n")
+    
+    def info(self, msg):
+        """Log an info message."""
+        timestamp = time.strftime('%H:%M:%S')
+        formatted_msg = f"[{timestamp}] [INFO] {msg}"
+        
+        # Write to file
+        with open(self.log_path, 'a') as f:
+            f.write(formatted_msg + "\n")
+        
+        # Print to console
+        if self.console_output:
+            print(formatted_msg)
+    
+    def warning(self, msg):
+        """Log a warning message."""
+        timestamp = time.strftime('%H:%M:%S')
+        formatted_msg = f"[{timestamp}] [WARN] {msg}"
+        
+        with open(self.log_path, 'a') as f:
+            f.write(formatted_msg + "\n")
+        
+        if self.console_output:
+            print(formatted_msg)
+    
+    def error(self, msg):
+        """Log an error message."""
+        timestamp = time.strftime('%H:%M:%S')
+        formatted_msg = f"[{timestamp}] [ERROR] {msg}"
+        
+        with open(self.log_path, 'a') as f:
+            f.write(formatted_msg + "\n")
+        
+        if self.console_output:
+            print(formatted_msg)
+    
+    def close(self):
+        """Finalize the log file."""
+        with open(self.log_path, 'a') as f:
+            f.write("\n" + "=" * 60 + "\n")
+            f.write(f"Finished at: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+
+def count_frames_for_scene(image_dir, scene_name):
+    """
+    统计场景的帧数（以 _0.jpg 结尾的图片数量）
+    
+    Args:
+        image_dir: 数据根目录
+        scene_name: 场景名称
+    
+    Returns:
+        帧数
+    """
+    pattern = os.path.join(image_dir, scene_name, "images_4", "*_0.jpg")
+    files = glob.glob(pattern)
+    return len(files)
+
+
+def run_full_sequence_inference(
+    config, model, dataset_class, scene_name, device='cuda',
+    sequence_length=20, overlap=3, logger=None
+):
+    """
+    对完整序列进行推理，使用 overlap 策略处理长序列。
+    
+    Args:
+        config: DGGTConfig 实例
+        model: 加载好的模型
+        dataset_class: Dataset 类（如 WaymoOpenDataset）
+        scene_name: 场景名称
+        device: 设备
+        sequence_length: 每个窗口的帧数
+        overlap: 窗口间的重叠帧数
+        logger: 日志记录器
+    
+    Returns:
+        dict: {
+            'rendered_images': [N, C, H, W] 完整序列的渲染结果,
+            'gt_images': [N, C, H, W] 完整序列的 GT 图像
+        }
+    """
+    # 统计总帧数
+    total_frames = count_frames_for_scene(config.image_dir, scene_name)
+    if logger:
+        logger.info(f"Scene {scene_name}: Total {total_frames} frames")
+    
+    if total_frames == 0:
+        if logger:
+            logger.error(f"No frames found for scene {scene_name}")
+        return None
+    
+    all_rendered_images = []
+    all_gt_images = []
+    
+    # 计算窗口参数
+    step = sequence_length - overlap
+    num_windows = (total_frames - overlap + step - 1) // step  # 向上取整
+    
+    if logger:
+        logger.info(f"Window strategy: length={sequence_length}, overlap={overlap}, step={step}")
+        logger.info(f"Estimated windows: {num_windows}")
+    
+    window_idx = 0
+    current_start = 0
+    
+    while current_start < total_frames:
+        # 计算当前窗口的帧范围
+        window_end = min(current_start + sequence_length, total_frames)
+        actual_length = window_end - current_start
+        
+        if logger:
+            logger.info(f"Window {window_idx}: frames [{current_start}, {window_end}) ({actual_length} frames)")
+        
+        # 创建临时 config - 使用 replace() 复制所有参数，只修改需要变化的字段
+        temp_config = replace(
+            config,
+            scene_names=[scene_name],
+            sequence_length=actual_length,
+            start_idx=current_start,
+            metrics=False  # 单独窗口不计算metrics，最后统一计算
+        )
+        
+        # 创建数据集
+        temp_dataset = dataset_class(
+            image_dir=config.image_dir,
+            scene_names=[scene_name],
+            sequence_length=actual_length,
+            start_idx=current_start,
+            mode=2,
+            views=config.input_views
+        )
+        
+        # 运行推理
+        results = run_inference_and_render(temp_config, model, temp_dataset, logger, device=device)
+        
+        if results and len(results) > 0:
+            rendered_images = results[0]['rendered_image']  # [T, C, H, W]
+            gt_images = results[0]['gt_image']  # [T, C, H, W]
+            
+            # 决定保留哪些帧
+            if window_idx == 0:
+                # 第一个窗口：保留所有帧
+                frames_to_keep = rendered_images
+                gt_to_keep = gt_images
+            else:
+                # 后续窗口：只保留后 (actual_length - overlap) 帧
+                discard_count = min(overlap, actual_length - 1)
+                frames_to_keep = rendered_images[discard_count:]
+                gt_to_keep = gt_images[discard_count:]
+            
+            if logger:
+                logger.info(f"  Window {window_idx}: keeping {frames_to_keep.shape[0]} frames")
+            
+            all_rendered_images.append(frames_to_keep)
+            all_gt_images.append(gt_to_keep)
+        
+        # 清理显存
+        torch.cuda.empty_cache()
+        
+        # 移动到下一个窗口
+        current_start += step
+        window_idx += 1
+        
+        # 如果下一个窗口起始位置已经超过或等于总帧数，退出
+        if current_start >= total_frames:
+            break
+            
+        # 如果剩余帧数太少（小于 overlap），合并到最后一个窗口处理
+        remaining = total_frames - current_start
+        if remaining <= overlap and window_idx > 0:
+            if logger:
+                logger.info(f"  Remaining {remaining} frames <= overlap, stopping")
+            break
+    
+    # 合并所有帧
+    if all_rendered_images:
+        all_rendered_images = torch.cat(all_rendered_images, dim=0)
+        all_gt_images = torch.cat(all_gt_images, dim=0)
+        if logger:
+            logger.info(f"Total rendered frames: {all_rendered_images.shape[0]}")
+        return {
+            'rendered_images': all_rendered_images,
+            'gt_images': all_gt_images
+        }
+    
+    return None
+
+
+def process_single_scene(
+    config, model, dataset_class, scene_name, device='cuda',
+    sequence_length=20, overlap=3, output_dir="outputs/full_sequence",
+    save_video_func=None, fps=8, logger=None
+):
+    """
+    处理单个场景的完整序列推理。
+    
+    Args:
+        config: DGGTConfig 实例
+        model: 加载好的模型
+        dataset_class: Dataset 类
+        scene_name: 场景名称
+        device: 设备
+        sequence_length: 每个窗口的帧数
+        overlap: 窗口间的重叠帧数
+        output_dir: 输出目录
+        save_video_func: 保存视频的函数
+        fps: 视频帧率
+        logger: 日志记录器（可选）
+    
+    Returns:
+        result: {'video_path': str, 'metrics': dict, 'num_frames': int}
+    """
+    # 初始化 LPIPS (如果需要计算 metrics)
+    loss_fn = None
+    if config.metrics:
+        loss_fn = lpips.LPIPS(net='alex').to(device)
+    
+    scene_result = {'video_path': None, 'metrics': None, 'num_frames': 0}
+    
+    try:
+        # 运行完整序列推理
+        inference_result = run_full_sequence_inference(
+            config=config,
+            model=model,
+            dataset_class=dataset_class,
+            scene_name=scene_name,
+            device=device,
+            sequence_length=sequence_length,
+            overlap=overlap,
+            logger=logger
+        )
+        
+        if inference_result is not None:
+            all_rendered = inference_result['rendered_images']
+            all_gt = inference_result['gt_images']
+            scene_result['num_frames'] = all_rendered.shape[0]
+            
+            # 计算完整序列的 metrics
+            if config.metrics and loss_fn is not None:
+                if logger:
+                    logger.info("Computing metrics for full sequence...")
+                
+                # 将数据移到正确的设备
+                all_rendered_device = all_rendered.to(device)
+                all_gt_device = all_gt.to(device)
+                
+                psnr, ssim, lpip = compute_metrics(all_rendered_device, all_gt_device, loss_fn)
+                
+                scene_result['metrics'] = {
+                    'psnr': psnr,
+                    'ssim': ssim,
+                    'lpips': lpip
+                }
+                
+                if logger:
+                    logger.info(f"Scene {scene_name} Full Sequence Metrics:")
+                    logger.info(f"  PSNR:   {psnr:.4f}")
+                    logger.info(f"  SSIM:   {ssim:.4f}")
+                    logger.info(f"  LPIPS:  {lpip:.4f}")
+                    logger.info(f"  Frames: {all_rendered.shape[0]}")
+            
+            # 保存视频和帧图片
+            if save_video_func is not None:
+                video_path = save_video_func(
+                    images=all_rendered,
+                    output_dir=output_dir,
+                    scene_name=scene_name,
+                    logger=logger,
+                    fps=fps
+                )
+                if logger:
+                    logger.info(f"Scene {scene_name} complete! Video saved to: {video_path}")
+                scene_result['video_path'] = video_path
+        else:
+            if logger:
+                logger.error(f"Scene {scene_name} failed or no frames found.")
+            
+    except Exception as e:
+        if logger:
+            logger.error(f"Exception during scene {scene_name}: {str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
+    return scene_result

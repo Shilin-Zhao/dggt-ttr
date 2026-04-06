@@ -3,6 +3,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import cv2
 import torch
+import imageio
+import torchvision.transforms as T
+from tqdm import tqdm
 
 # -----------------------------------------------------------------------------
 # 1. Visualization Helper Functions
@@ -51,15 +54,42 @@ def apply_overlay(image, mask, color=(1, 0, 0), alpha=0.4):
     output = image * (1 - alpha * mask_layer) + colored_layer * (alpha * mask_layer)
     return np.clip(output, 0, 1)
 
-def visualize_samples(dataset, sample_indices, output_path=None):
+def _compose_triview(center, left, right, spacer_width=10):
+    """Horizontally concatenate left | center | right with white spacers.
+    All inputs are [H, W, 3] numpy arrays in 0-1 range.
+    """
+    H = center.shape[0]
+    spacer = np.ones((H, spacer_width, 3))
+    return np.concatenate([left, spacer, center, spacer, right], axis=1)
+
+
+def compute_color_gradient_map(image_np):
+    """
+    Compute normalized color gradient magnitude map from RGB image [H, W, 3] in [0, 1].
+    Returns [H, W] in [0, 1].
+    """
+    img = np.clip(image_np, 0, 1).astype(np.float32)
+    gray = cv2.cvtColor((img * 255.0).astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+
+    grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = np.sqrt(grad_x ** 2 + grad_y ** 2)
+
+    # Robust normalization to keep visualization stable across scenes
+    high = np.percentile(grad_mag, 99)
+    if high > 1e-8:
+        grad_mag = grad_mag / high
+    return np.clip(grad_mag, 0, 1)
+
+
+def visualize_samples(dataset, sample_indices, output_path=None, views=1):
     """
     Extracts one batch (sequence) and visualizes specific frames.
+    When views=3, sample_indices refer to *group* indices (each group = 3 interleaved frames).
     """
-    # Load one batch (Sequence)
-    # dataset[0] usually loads the sequence defined by start_idx in mode 2
     data_dict = dataset[0] 
     
-    images = data_dict['images']         # [S, C, H, W]
+    images = data_dict['images']         # [S, C, H, W]  (S = seq*views)
     masks_bicubic = data_dict['masks']   # [S, C, H, W]
     masks_nearest = data_dict['nearest_masks'] # [S, C, H, W]
     
@@ -67,76 +97,83 @@ def visualize_samples(dataset, sample_indices, output_path=None):
     if has_dynamic:
         masks_dynamic = data_dict['dynamic_mask'] # [S, C, H, W]
 
-    print(f"Loaded sequence length: {images.shape[0]}")
+    total_frames = images.shape[0]
+    num_groups = total_frames // views if views == 3 else total_frames
+    print(f"Loaded sequence: {total_frames} frames, views={views}, groups={num_groups}")
     print(f"Image shape: {images.shape}")
     
-    # Iterate through requested frame indices
-    for frame_idx in sample_indices:
-        if frame_idx >= images.shape[0]:
-            print(f"Skipping index {frame_idx}, out of bounds (seq len {images.shape[0]})")
+    for group_idx in sample_indices:
+        if group_idx >= num_groups:
+            print(f"Skipping index {group_idx}, out of bounds (groups={num_groups})")
             continue
-            
-        print(f"Visualizing Frame {frame_idx}...")
-        
-        # Prepare Data
-        img_np = tensor_to_img_numpy(images[frame_idx])
-        mask_bi_np = tensor_to_img_numpy(masks_bicubic[frame_idx])
-        mask_near_np = tensor_to_img_numpy(masks_nearest[frame_idx])
-        
-        # --- Critical Logic Simulation ---
-        # Simulate the logic: bg_mask = (sky_mask == 0).any(dim=-1)
-        # In numpy: (H, W, C) -> axis=2
-        # mask == 0 means "Sky" (assuming black is sky in mask file)
-        # We want to visualize what the code thinks is "Sky"
-        
-        # 1. Bicubic Logic
-        # Because of interpolation, 0 might become 0.001, so strict == 0 fails (is False),
-        # meaning it gets classified as Foreground (not sky).
-        # Or if 1 becomes 0.99, it stays Foreground.
-        # Let's visualize strict == 0 regions.
-        is_sky_bicubic = (mask_bi_np ==0).any(axis=-1).astype(float)
-        
-        # 2. Nearest Logic
-        is_sky_nearest = (mask_near_np == 0).any(axis=-1).astype(float)
-        
-        # 3. Dynamic Mask
+
+        if views == 3:
+            idxs = [3 * group_idx + v for v in range(3)]  # center, left, right
+            print(f"Visualizing Group {group_idx} (frames {idxs})...")
+        else:
+            idxs = [group_idx]
+            print(f"Visualizing Frame {group_idx}...")
+
+        imgs_np = [tensor_to_img_numpy(images[i]) for i in idxs]
+        masks_bi_np = [tensor_to_img_numpy(masks_bicubic[i]) for i in idxs]
+        masks_near_np = [tensor_to_img_numpy(masks_nearest[i]) for i in idxs]
+
+        sky_bi = [(m == 0).any(axis=-1).astype(float) for m in masks_bi_np]
+        sky_near = [(m == 0).any(axis=-1).astype(float) for m in masks_near_np]
+        grad_maps = [compute_color_gradient_map(img) for img in imgs_np]
+        grad_overlay = [apply_overlay(imgs_np[v], grad_maps[v], color=(1, 1, 0), alpha=0.6) for v in range(len(idxs))]
+
         if has_dynamic:
-            mask_dyn_np = tensor_to_img_numpy(masks_dynamic[frame_idx])
-            # Dynamic mask usually: 1=Dynamic Object, 0=Background
-            # Let's visualize the object part (non-zero)
-            is_dynamic = (mask_dyn_np > 0.5).any(axis=-1).astype(float)
-        
-        # --- Plotting ---
-        cols = 4 if has_dynamic else 3
-        fig, axes = plt.subplots(1, cols, figsize=(5*cols, 4))
-        plt.suptitle(f"Frame {frame_idx} Analysis", fontsize=16)
-        
-        # Col 1: Original Image
-        axes[0].imshow(img_np)
-        axes[0].set_title("Original Image")
-        axes[0].axis('off')
-        
-        # Col 2: Bicubic Sky Logic (Red Overlay)
-        # Red areas are what the code thinks is SKY based on (mask==0)
-        # Note: If bicubic makes sky 0.001, it won't be red here, showing the bug.
-        overlay_bi = apply_overlay(img_np, is_sky_bicubic, color=(1, 0, 0), alpha=0.5)
-        axes[1].imshow(overlay_bi)
-        axes[1].set_title(f"Bicubic 'Strict 0' (Sky)\n(Bug: Edges might be lost)")
-        axes[1].axis('off')
-        
-        # Col 3: Nearest Sky Logic (Green Overlay)
-        overlay_near = apply_overlay(img_np, is_sky_nearest, color=(0, 1, 0), alpha=0.5)
-        axes[2].imshow(overlay_near)
-        axes[2].set_title("Nearest 'Strict 0' (Sky)\n(Expected: Sharp Edges)")
-        axes[2].axis('off')
-        
-        # Col 4: Dynamic Mask (Blue Overlay)
-        if has_dynamic:
-            overlay_dyn = apply_overlay(img_np, is_dynamic, color=(0, 0, 1), alpha=0.6)
-            axes[3].imshow(overlay_dyn)
-            axes[3].set_title("Dynamic Mask (Objects)")
+            masks_dyn_np = [tensor_to_img_numpy(masks_dynamic[i]) for i in idxs]
+            is_dyn = [(m > 0.5).any(axis=-1).astype(float) for m in masks_dyn_np]
+
+        if views == 3:
+            img_comp = _compose_triview(imgs_np[0], imgs_np[1], imgs_np[2])
+            ov_bi_list = [apply_overlay(imgs_np[v], sky_bi[v], color=(1, 0, 0), alpha=0.5) for v in range(3)]
+            ov_bi_comp = _compose_triview(ov_bi_list[0], ov_bi_list[1], ov_bi_list[2])
+            ov_near_list = [apply_overlay(imgs_np[v], sky_near[v], color=(0, 1, 0), alpha=0.5) for v in range(3)]
+            ov_near_comp = _compose_triview(ov_near_list[0], ov_near_list[1], ov_near_list[2])
+            grad_overlay_comp = _compose_triview(grad_overlay[0], grad_overlay[1], grad_overlay[2])
+
+            rows = 5 if has_dynamic else 4
+            fig, axes = plt.subplots(rows, 1, figsize=(20, 5 * rows))
+            plt.suptitle(f"Group {group_idx} (Left | Center | Right)", fontsize=16)
+
+            axes[0].imshow(img_comp); axes[0].set_title("Original"); axes[0].axis('off')
+            axes[1].imshow(ov_bi_comp); axes[1].set_title("Bicubic Sky (Red)"); axes[1].axis('off')
+            axes[2].imshow(ov_near_comp); axes[2].set_title("Nearest Sky (Green)"); axes[2].axis('off')
+            axes[3].imshow(grad_overlay_comp); axes[3].set_title("Color Gradient Overlay (Yellow)"); axes[3].axis('off')
+
+            if has_dynamic:
+                ov_dyn_list = [apply_overlay(imgs_np[v], is_dyn[v], color=(0, 0, 1), alpha=0.6) for v in range(3)]
+                ov_dyn_comp = _compose_triview(ov_dyn_list[0], ov_dyn_list[1], ov_dyn_list[2])
+                axes[4].imshow(ov_dyn_comp); axes[4].set_title("Dynamic (Blue)"); axes[4].axis('off')
+        else:
+            img_np = imgs_np[0]
+            cols = 5 if has_dynamic else 4
+            fig, axes = plt.subplots(1, cols, figsize=(5 * cols, 4))
+            plt.suptitle(f"Frame {group_idx} Analysis", fontsize=16)
+
+            axes[0].imshow(img_np); axes[0].set_title("Original Image"); axes[0].axis('off')
+
+            overlay_bi = apply_overlay(img_np, sky_bi[0], color=(1, 0, 0), alpha=0.5)
+            axes[1].imshow(overlay_bi)
+            axes[1].set_title("Bicubic 'Strict 0' (Sky)\n(Bug: Edges might be lost)")
+            axes[1].axis('off')
+
+            overlay_near = apply_overlay(img_np, sky_near[0], color=(0, 1, 0), alpha=0.5)
+            axes[2].imshow(overlay_near)
+            axes[2].set_title("Nearest 'Strict 0' (Sky)\n(Expected: Sharp Edges)")
+            axes[2].axis('off')
+
+            axes[3].imshow(grad_maps[0], cmap='magma')
+            axes[3].set_title("Color Gradient Magnitude")
             axes[3].axis('off')
-            
+
+            if has_dynamic:
+                overlay_dyn = apply_overlay(img_np, is_dyn[0], color=(0, 0, 1), alpha=0.6)
+                axes[4].imshow(overlay_dyn); axes[4].set_title("Dynamic Mask (Objects)"); axes[4].axis('off')
+
         plt.tight_layout()
         plt.show()
 
@@ -273,154 +310,145 @@ def apply_heatmap_overlay(image, scalar_map, cmap_name='turbo', alpha=0.5):
     output = image * (1 - alpha) + heatmap * alpha
     return np.clip(output, 0, 1)
 
-def visualize_inference_results(scene_data, samples=None):
+def visualize_inference_results(scene_data, samples=None, views=1):
     if scene_data is None:
         print("No scene data to visualize.")
         return
 
-    # --- Helpers ---
     def to_np_img(t):
-        """Tensor [C, H, W] -> Numpy [H, W, C] (0-1)"""
         return np.clip(t.detach().cpu().permute(1, 2, 0).numpy(), 0, 1)
     
     def to_np_mask(t):
-        """Tensor [C, H, W] -> Numpy [H, W] (Take channel 0)"""
         return t.detach().cpu().permute(1, 2, 0).numpy()[:, :, 0]
     
-    def apply_overlay(bg_img, mask, color=(1, 0, 0), alpha=0.5):
-        """Overlay a mask color on top of an image."""
-        overlay = bg_img.copy()
+    def _overlay(bg_img, mask, color=(1, 0, 0), alpha=0.5):
         colored = np.zeros_like(bg_img)
         for c in range(3):
             colored[:, :, c] = color[c]
-        
-        # Expand mask
         m = mask[:, :, None]
-        # Blend
         return bg_img * (1 - alpha * m) + colored * (alpha * m)
 
-    # --- Unpack Data ---
     gt_imgs = scene_data['gt_image']          # [T, C, H, W]
     render_imgs = scene_data['rendered_image'] # [T, C, H, W]
     depths = scene_data['depth_maps']          # [T, H, W]
     alphas = scene_data['alphas']              # [T, H, W, 1]
-    
-    # Masks from DataLoader (Batch 0)
     masks_bi = scene_data['masks'][0]          # [T, C, H, W]
     masks_near = scene_data['nearest_masks'][0]# [T, C, H, W]
     
-    # Check for DA3 Depth
     da3_depths = None
     if 'da3_depth' in scene_data and scene_data['da3_depth'] is not None:
-        # da3_depth might be [B, T, 1, H, W] or [T, 1, H, W] inside scene_data depending on how it was saved
-        # Let's try to normalize it to [T, H, W]
         d3 = scene_data['da3_depth']
-        if d3.dim() == 5: d3 = d3[0] # Take batch 0 -> [T, 1, H, W]
-        if d3.dim() == 4: d3 = d3.squeeze(1) # -> [T, H, W]
+        if d3.dim() == 5: d3 = d3[0]
+        if d3.dim() == 4: d3 = d3.squeeze(1)
         da3_depths = d3
 
     T_total = gt_imgs.shape[0]
+    num_groups = T_total // views if views == 3 else T_total
     
-    # Handle Samples
     if samples is None:
-        samples = range(T_total)
+        samples = range(num_groups)
     
-    print(f"Visualizing {len(samples)} frames from total {T_total} frames...")
+    print(f"Visualizing {len(list(samples))} groups from total {T_total} frames (views={views})...")
 
-    for t in samples:
-        if t >= T_total:
-            print(f"Index {t} out of bounds, skipping.")
+    for g in samples:
+        if g >= num_groups:
+            print(f"Index {g} out of bounds, skipping.")
             continue
-            
-        print(f"Processing Frame {t}...")
-        
-        # Prepare Data for this frame
-        img_gt = to_np_img(gt_imgs[t])
-        img_pred = to_np_img(render_imgs[t])
-        
-        # Masks (0=Sky, 1=Obj usually. Let's visualize the "Sky" part: mask==0)
-        # Assuming input mask: 0 for Sky, 1 for Object
-        m_bi_raw = to_np_mask(masks_bi[t])
-        m_near_raw = to_np_mask(masks_near[t])
-        
-        # Create "Strict Sky" masks for overlay (Values close to 0)
-        # Using < 0.01 threshold for float tolerance
-        is_sky_bi = (m_bi_raw < 0.01).astype(float) 
-        is_sky_near = (m_near_raw < 0.01).astype(float)
-        
-        # Depths
-        d_pred = depths[t].detach().cpu().numpy()
-        d_pred_norm = (d_pred - d_pred.min()) / (d_pred.max() - d_pred.min() + 1e-8)
-        
-        d_da3_norm = None
-        if da3_depths is not None:
-            d3 = da3_depths[t].detach().cpu().numpy()
-            # Handle valid mask for DA3 (often 0 is invalid)
-            valid_mask = d3 > 0
-            if valid_mask.any():
-                d_min, d_max = d3[valid_mask].min(), d3[valid_mask].max()
-                d_da3_norm = (d3 - d_min) / (d_max - d_min + 1e-8)
-                d_da3_norm[~valid_mask] = 0
-            else:
-                d_da3_norm = np.zeros_like(d3)
 
-        # Alpha
-        alpha_map = alphas[t].detach().cpu().squeeze().numpy() # [H, W]
+        if views == 3:
+            idxs = [3 * g + v for v in range(3)]  # center, left, right
+            print(f"Processing Group {g} (frames {idxs})...")
 
-        # --- Plotting (4 Rows, 2 Cols) ---
-        fig, axs = plt.subplots(4, 2, figsize=(12, 16), dpi=100)
-        fig.suptitle(f"Scene Frame {t}", fontsize=16)
+            gts = [to_np_img(gt_imgs[i]) for i in idxs]
+            preds = [to_np_img(render_imgs[i]) for i in idxs]
+            d_preds = [depths[i].detach().cpu().numpy() for i in idxs]
+            alpha_maps = [alphas[i].detach().cpu().squeeze().numpy() for i in idxs]
+            sky_bi = [(to_np_mask(masks_bi[i]) < 0.01).astype(float) for i in idxs]
+            sky_near = [(to_np_mask(masks_near[i]) < 0.01).astype(float) for i in idxs]
 
-        # Row 1: GT vs Predicted
-        axs[0, 0].imshow(img_gt)
-        axs[0, 0].set_title("GT Image")
-        axs[0, 0].axis('off')
-        
-        axs[0, 1].imshow(img_pred)
-        axs[0, 1].set_title("Predicted Image")
-        axs[0, 1].axis('off')
+            fig, axs = plt.subplots(6, 1, figsize=(20, 30), dpi=100)
+            fig.suptitle(f"Group {g} (Left | Center | Right)", fontsize=16)
 
-        # Row 2: Pred + Sky Mask (Bicubic) vs Pred + Nearest Mask
-        # Red Overlay for Bicubic Sky
-        ov_bi = apply_overlay(img_pred, is_sky_bi, color=(1, 0, 0), alpha=0.5)
-        axs[1, 0].imshow(ov_bi)
-        axs[1, 0].set_title("Pred + Sky Mask (Bicubic)\nRed = Code thinks is Sky")
-        axs[1, 0].axis('off')
+            gt_comp = _compose_triview(gts[0], gts[1], gts[2])
+            pred_comp = _compose_triview(preds[0], preds[1], preds[2])
+            axs[0].imshow(gt_comp); axs[0].set_title("GT"); axs[0].axis('off')
+            axs[1].imshow(pred_comp); axs[1].set_title("Predicted"); axs[1].axis('off')
 
-        # Green Overlay for Nearest Sky
-        ov_near = apply_overlay(img_pred, is_sky_near, color=(0, 1, 0), alpha=0.5)
-        axs[1, 1].imshow(ov_near)
-        axs[1, 1].set_title("Pred + Nearest Sky Mask\nGreen = Strict Sky")
-        axs[1, 1].axis('off')
+            ov_near = [_overlay(preds[v], sky_near[v], color=(0, 1, 0), alpha=0.5) for v in range(3)]
+            axs[2].imshow(_compose_triview(ov_near[0], ov_near[1], ov_near[2]))
+            axs[2].set_title("Pred + Nearest Sky (Green)"); axs[2].axis('off')
 
-        # Row 3: Predicted Depth vs DA3 Depth
-        axs[2, 0].imshow(d_pred_norm, cmap='turbo')
-        axs[2, 0].set_title("Predicted Depth")
-        axs[2, 0].axis('off')
+            d_norms = []
+            for d in d_preds:
+                d_norms.append((d - d.min()) / (d.max() - d.min() + 1e-8))
+            cmap = plt.get_cmap('turbo')
+            depth_rgbs = [cmap(dn)[:, :, :3] for dn in d_norms]
+            axs[3].imshow(_compose_triview(depth_rgbs[0], depth_rgbs[1], depth_rgbs[2]))
+            axs[3].set_title("Predicted Depth"); axs[3].axis('off')
 
-        if d_da3_norm is not None:
-            axs[2, 1].imshow(d_da3_norm, cmap='turbo')
-            axs[2, 1].set_title("DA3 Depth Prior")
+            alpha_rgbs = [np.stack([a]*3, axis=-1) for a in alpha_maps]
+            axs[4].imshow(_compose_triview(alpha_rgbs[0], alpha_rgbs[1], alpha_rgbs[2]))
+            axs[4].set_title("Opacity (Alpha)"); axs[4].axis('off')
+
+            masked = [preds[v] * np.stack([alpha_maps[v]]*3, axis=-1) for v in range(3)]
+            axs[5].imshow(_compose_triview(masked[0], masked[1], masked[2]))
+            axs[5].set_title("Predicted * Alpha"); axs[5].axis('off')
+
         else:
-            axs[2, 1].text(0.5, 0.5, "DA3 Depth Not Available", ha='center')
-        axs[2, 1].axis('off')
+            t = g
+            print(f"Processing Frame {t}...")
+            img_gt = to_np_img(gt_imgs[t])
+            img_pred = to_np_img(render_imgs[t])
+            m_bi_raw = to_np_mask(masks_bi[t])
+            m_near_raw = to_np_mask(masks_near[t])
+            is_sky_bi = (m_bi_raw < 0.01).astype(float)
+            is_sky_near = (m_near_raw < 0.01).astype(float)
+            d_pred = depths[t].detach().cpu().numpy()
+            d_pred_norm = (d_pred - d_pred.min()) / (d_pred.max() - d_pred.min() + 1e-8)
+            
+            d_da3_norm = None
+            if da3_depths is not None:
+                d3_val = da3_depths[t].detach().cpu().numpy()
+                valid_mask = d3_val > 0
+                if valid_mask.any():
+                    d_min, d_max = d3_val[valid_mask].min(), d3_val[valid_mask].max()
+                    d_da3_norm = (d3_val - d_min) / (d_max - d_min + 1e-8)
+                    d_da3_norm[~valid_mask] = 0
+                else:
+                    d_da3_norm = np.zeros_like(d3_val)
 
-        # Row 4: Opacity Map vs Opacity Overlay
-        # Left: Pure Alpha Map
-        axs[3, 0].imshow(alpha_map, cmap='gray', vmin=0, vmax=1)
-        axs[3, 0].set_title("Opacity (Alpha) Map\nWhite=Opaque, Black=Transparent")
-        axs[3, 0].axis('off')
+            alpha_map = alphas[t].detach().cpu().squeeze().numpy()
 
-        # Right: Pred Image * Alpha (Show what is actually rendered opaque)
-        # Or Overlay Blue for high opacity
-        # Let's show the Rendered Image multiplied by Alpha to see "Just the Object"
-        # Expanding alpha to 3 channels
-        alpha_3c = np.stack([alpha_map]*3, axis=-1)
-        masked_render = img_pred * alpha_3c
-        # Add a checkerboard background for transparency simulation? Or just black.
-        axs[3, 1].imshow(masked_render)
-        axs[3, 1].set_title("Predicted Image * Alpha\n(Content from Gaussians only)")
-        axs[3, 1].axis('off')
+            fig, axs = plt.subplots(4, 2, figsize=(12, 16), dpi=100)
+            fig.suptitle(f"Scene Frame {t}", fontsize=16)
+
+            axs[0, 0].imshow(img_gt); axs[0, 0].set_title("GT Image"); axs[0, 0].axis('off')
+            axs[0, 1].imshow(img_pred); axs[0, 1].set_title("Predicted Image"); axs[0, 1].axis('off')
+
+            ov_bi = _overlay(img_pred, is_sky_bi, color=(1, 0, 0), alpha=0.5)
+            axs[1, 0].imshow(ov_bi)
+            axs[1, 0].set_title("Pred + Sky Mask (Bicubic)\nRed = Code thinks is Sky")
+            axs[1, 0].axis('off')
+            ov_near = _overlay(img_pred, is_sky_near, color=(0, 1, 0), alpha=0.5)
+            axs[1, 1].imshow(ov_near)
+            axs[1, 1].set_title("Pred + Nearest Sky Mask\nGreen = Strict Sky")
+            axs[1, 1].axis('off')
+
+            axs[2, 0].imshow(d_pred_norm, cmap='turbo'); axs[2, 0].set_title("Predicted Depth"); axs[2, 0].axis('off')
+            if d_da3_norm is not None:
+                axs[2, 1].imshow(d_da3_norm, cmap='turbo'); axs[2, 1].set_title("DA3 Depth Prior")
+            else:
+                axs[2, 1].text(0.5, 0.5, "DA3 Depth Not Available", ha='center', transform=axs[2, 1].transAxes)
+            axs[2, 1].axis('off')
+
+            axs[3, 0].imshow(alpha_map, cmap='gray', vmin=0, vmax=1)
+            axs[3, 0].set_title("Opacity (Alpha) Map\nWhite=Opaque, Black=Transparent")
+            axs[3, 0].axis('off')
+            alpha_3c = np.stack([alpha_map]*3, axis=-1)
+            masked_render = img_pred * alpha_3c
+            axs[3, 1].imshow(masked_render)
+            axs[3, 1].set_title("Predicted Image * Alpha\n(Content from Gaussians only)")
+            axs[3, 1].axis('off')
 
         plt.tight_layout()
         plt.show()
@@ -511,3 +539,113 @@ def visualize_depth_alignment_6panel(
     if output_path:
         plt.savefig(output_path)
     plt.show()
+
+
+# -----------------------------------------------------------------------------
+# Full Sequence Video Saving
+# -----------------------------------------------------------------------------
+
+def save_full_sequence_video(images, output_dir, scene_name, logger, fps=8, save_frames=True):
+    """
+    将完整序列保存为视频和（可选）单独的帧图片。
+    
+    Args:
+        images: [T, C, H, W] tensor, values in [0, 1]
+        output_dir: 输出目录
+        scene_name: 场景名称
+        logger: 日志记录器
+        fps: 视频帧率 (默认 8)
+        save_frames: 是否保存单独的帧图片 (默认 False，只保存视频)
+    
+    Returns:
+        video_path: 保存的视频路径
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    images_cpu = images.detach().cpu()
+    num_frames = images_cpu.shape[0]
+    
+    image_list = []
+    
+    # 可选：保存单独的帧图片
+    if save_frames:
+        frames_dir = os.path.join(output_dir, f"scene_{scene_name}_frames")
+        os.makedirs(frames_dir, exist_ok=True)
+        if logger:
+            logger.info(f"Saving {num_frames} frames to {frames_dir}...")
+        
+        for i in range(num_frames):
+            rendered = images_cpu[i].clamp(0, 1)
+            # 保存单帧图片
+            image_path = os.path.join(frames_dir, f"frame_{i:04d}.png")
+            T.ToPILImage()(rendered).save(image_path)
+            # 收集用于视频
+            image_list.append(rendered.permute(1, 2, 0).numpy())
+    else:
+        # 只收集用于视频，不保存单帧
+        for i in range(num_frames):
+            rendered = images_cpu[i].clamp(0, 1)
+            image_list.append(rendered.permute(1, 2, 0).numpy())
+    
+    # 保存视频
+    video_path = os.path.join(output_dir, f"scene_{scene_name}_full_video.mp4")
+    if logger:
+        logger.info(f"Encoding video with {num_frames} frames at {fps} fps...")
+    
+    imageio.mimwrite(
+        video_path, 
+        (np.array(image_list) * 255).astype(np.uint8), 
+        fps=fps, 
+        codec="libx264"
+    )
+    
+    if save_frames:
+        logger.info(f"Saved {num_frames} frames to {frames_dir}")
+    logger.info(f"Saved video to {video_path}")
+    
+    return video_path
+
+
+def save_comparison_video(gt_images, rendered_images, output_dir, scene_name, logger, fps=8):
+    """
+    保存 GT 和渲染结果的对比视频（左右并排）。
+    
+    Args:
+        gt_images: [T, C, H, W] tensor, GT images
+        rendered_images: [T, C, H, W] tensor, rendered images
+        output_dir: 输出目录
+        scene_name: 场景名称
+        logger: 日志记录器
+        fps: 视频帧率
+    
+    Returns:
+        video_path: 保存的视频路径
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    gt_cpu = gt_images.detach().cpu()
+    render_cpu = rendered_images.detach().cpu()
+    
+    num_frames = min(gt_cpu.shape[0], render_cpu.shape[0])
+    
+    comparison_list = []
+    
+    logger.info(f"Creating comparison video with {num_frames} frames...")
+    
+    for i in tqdm(range(num_frames), desc="Creating comparison", unit="frame"):
+        gt_frame = gt_cpu[i].clamp(0, 1).permute(1, 2, 0).numpy()
+        render_frame = render_cpu[i].clamp(0, 1).permute(1, 2, 0).numpy()
+        
+        H, W = gt_frame.shape[:2]
+        
+        # 创建白色分隔条
+        separator = np.ones((H, 10, 3), dtype=np.float32)
+        
+        # 左右并排
+        comparison = np.concatenate([gt_frame, separator, render_frame], axis=1)
+        comparison_list.append((comparison * 255).astype(np.uint8))
+    
+    video_path = os.path.join(output_dir, f"scene_{scene_name}_comparison.mp4")
+    imageio.mimwrite(video_path, comparison_list, fps=fps, codec="libx264")
+    
+    logger.info(f"Saved comparison video to {video_path}")
+    return video_path
